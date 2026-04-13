@@ -1079,68 +1079,83 @@ function getProcType(name) {
 
   root.innerHTML = `
     <h2 style="margin:0 0 10px 0;">Аналитика</h2>
-    <div class="badge" style="margin-bottom:10px; display:flex; flex-wrap:wrap; gap:10px; align-items:center;">
-      <label class="muted">Тип профиля:</label>
-      <select id="anProfileType">
-        <option value="">(без профиля)</option>
-        <option value="machine">машина</option>
-        <option value="process">процесс</option>
-      </select>
 
-      <label class="muted">Хост:</label>
-      <select id="anHostSel"></select>
+    <div class="card" style="margin-bottom:12px;">
+      <h3 style="margin-top:0;">Оповещения</h3>
+      <div class="badge" style="display:flex; flex-wrap:wrap; gap:10px; align-items:center;">
+        <select id="alPeriod">
+          <option value="24h">24ч</option>
+          <option value="7d" selected>7д</option>
+          <option value="30d">30д</option>
+        </select>
 
-      <label class="muted">Процесс:</label>
-      <select id="anProcessSel"><option value="">(выберите процесс)</option></select>
+        <select id="alStatus">
+          <option value="">Статус: все</option>
+          <option value="new">Новый</option>
+          <option value="ack">В работе</option>
+          <option value="closed">Закрыт</option>
+        </select>
 
-      <label class="muted">Дней:</label>
-      <input id="anDays" type="number" min="1" max="365" value="14" style="width:90px;" />
+        <select id="alSeverity">
+          <option value="">Уровень: все</option>
+          <option value="low">Низкий</option>
+          <option value="med">Средний</option>
+          <option value="high">Высокий</option>
+        </select>
 
-      <span class="muted">Оповещения:</span>
+        <select id="alEntityType">
+          <option value="">Сущность: все</option>
+          <option value="process_session">сессия процесса</option>
+          <option value="process_chain">цепочка процессов</option>
+        </select>
 
-      <select id="alPeriod">
-        <option value="24h">24ч</option>
-        <option value="7d" selected>7д</option>
-        <option value="30d">30д</option>
-      </select>
+        <select id="alRuleType">
+          <option value="">Правило: все</option>
+          <option value="rarity">редкость</option>
+          <option value="chain">цепочка</option>
+          <option value="time">время</option>
+          <option value="resources">ресурсы</option>
+          <option value="combined">комбинированное</option>
+        </select>
 
-      <select id="alStatus">
-        <option value="">Статус: все</option>
-        <option value="new">Новый</option>
-        <option value="ack">В работе</option>
-        <option value="closed">Закрыт</option>
-      </select>
-
-      <select id="alSeverity">
-        <option value="">Уровень: все</option>
-        <option value="low">Низкий</option>
-        <option value="med">Средний</option>
-        <option value="high">Высокий</option>
-      </select>
-
-      <select id="alEntityType">
-        <option value="">Сущность: все</option>
-        <option value="process_session">сессия процесса</option>
-        <option value="process_chain">цепочка процессов</option>
-      </select>
-
-      <select id="alRuleType">
-        <option value="">Правило: все</option>
-        <option value="rarity">редкость</option>
-        <option value="chain">цепочка</option>
-        <option value="time">время</option>
-        <option value="resources">ресурсы</option>
-        <option value="combined">комбинированное</option>
-      </select>
-
-      <button id="anRefresh" style="padding:6px 10px; border-radius:999px; border:1px solid #ddd; cursor:pointer;">Обновить</button>
+        <button id="anRefresh" style="padding:6px 10px; border-radius:999px; border:1px solid #ddd; cursor:pointer;">Обновить</button>
+      </div>
     </div>
-    <div id="anOut"></div>
+
+    <div id="anAlertsOut"></div>
+
+    <div class="card" style="margin:12px 0;">
+      <h3 style="margin-top:0;">Профили</h3>
+      <div class="badge" style="display:flex; flex-wrap:wrap; gap:10px; align-items:center;">
+        <label class="muted">Тип профиля:</label>
+        <select id="anProfileType">
+          <option value="machine">машина</option>
+          <option value="process">процесс</option>
+          <option value="chain">цепочка</option>
+        </select>
+
+        <label class="muted">Хост:</label>
+        <select id="anHostSel"></select>
+
+        <label class="muted">Процесс:</label>
+        <select id="anProcessSel"><option value="">(выберите процесс)</option></select>
+
+        <label class="muted">Цепочка:</label>
+        <select id="anChainSel"><option value="">(выберите цепочку)</option></select>
+
+        <label class="muted">Дней:</label>
+        <input id="anDays" type="number" min="1" max="365" value="14" style="width:90px;" />
+      </div>
+    </div>
+
+    <div id="anProfilesOut"></div>
   `;
 
-  const out = byId("anOut");
+  const alertsOut = byId("anAlertsOut");
+  const profilesOut = byId("anProfilesOut");
   const hostSel = byId("anHostSel");
   const procSel = byId("anProcessSel");
+  const chainSel = byId("anChainSel");
   const profileTypeSel = byId("anProfileType");
 
   function isoSinceFromPeriod(p) {
@@ -1343,11 +1358,14 @@ function getProcType(name) {
 
       if (profileTypeSel.value === "machine") profileHtml = await loadMachineProfile();
       if (profileTypeSel.value === "process") profileHtml = await loadProcessProfile();
-      if (profileTypeSel.value === "chains") profileHtml = await loadChainsProfile();
+      if (profileTypeSel.value === "chain") profileHtml = await loadChainProfile();
 
-      out.innerHTML = alertsHtml + profileHtml;
+      alertsOut.innerHTML = alertsHtml;
+      profilesOut.innerHTML = profileHtml;
+
     } catch (e) {
-      out.innerHTML = `<div class="error">Ошибка аналитики: ${escapeHtml(e.message || String(e))}</div>`;
+      alertsOut.innerHTML = `<div class="error">Ошибка аналитики: ${escapeHtml(e.message || String(e))}</div>`;
+      profilesOut.innerHTML = "";
     }
   }
 
