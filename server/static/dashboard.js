@@ -1073,246 +1073,258 @@ function getProcType(name) {
 
   // Analytics tab
 
-  async function renderAnalytics() {
-    const root = byId("analyticsRoot");
-    if (!root) return;
+ async function renderAnalytics() {
+  const root = byId("analyticsRoot");
+  if (!root) return;
 
-    root.innerHTML = `
-      <h2 style="margin:0 0 10px 0;">Аналитика</h2>
-      <div class="badge" style="margin-bottom:10px; display:flex; flex-wrap:wrap; gap:10px; align-items:center;">
-        <label class="muted">Хост:</label>
-        <select id="anHostSel" style="padding:6px 10px; border-radius:999px; border:1px solid #ddd;"></select>
+  root.innerHTML = `
+    <h2 style="margin:0 0 10px 0;">Аналитика</h2>
+    <div class="badge" style="margin-bottom:10px; display:flex; flex-wrap:wrap; gap:10px; align-items:center;">
+      <label class="muted">Тип профиля:</label>
+      <select id="anProfileType">
+        <option value="">(без профиля)</option>
+        <option value="machine">машина</option>
+        <option value="process">процесс</option>
+      </select>
 
-        <label class="muted">Дней:</label>
-        <input id="anDays" type="number" min="1" max="365" value="14" style="width:90px; padding:6px 10px; border-radius:999px; border:1px solid #ddd;" />
+      <label class="muted">Хост:</label>
+      <select id="anHostSel"></select>
 
-        <label class="hint" style="display:flex; align-items:center; gap:6px;">
-          <input type="checkbox" id="anaShowSha"> Показывать sha256
-        </label>
+      <label class="muted">Процесс:</label>
+      <select id="anProcessSel"><option value="">(выберите процесс)</option></select>
 
-        <span class="muted" style="margin-left:10px;">Алерты:</span>
+      <label class="muted">Дней:</label>
+      <input id="anDays" type="number" min="1" max="365" value="14" style="width:90px;" />
 
-        <select id="alPeriod">
-          <option value="24h">24ч</option>
-          <option value="7d" selected>7д</option>
-          <option value="30d">30д</option>
-        </select>
+      <span class="muted">Оповещения:</span>
 
-        <select id="alStatus">
-          <option value="">Статус: все</option>
-          <option value="new">Новый</option>
-          <option value="ack">В работе</option>
-          <option value="closed">Закрыт</option>
-        </select>
+      <select id="alPeriod">
+        <option value="24h">24ч</option>
+        <option value="7d" selected>7д</option>
+        <option value="30d">30д</option>
+      </select>
 
-        <select id="alSeverity">
-          <option value="">Уровень: все</option>
-          <option value="low">Низкий</option>
-          <option value="med">Средний</option>
-          <option value="high">Высокий</option>
-        </select>
+      <select id="alStatus">
+        <option value="">Статус: все</option>
+        <option value="new">Новый</option>
+        <option value="ack">В работе</option>
+        <option value="closed">Закрыт</option>
+      </select>
 
-        <select id="alMetric">
-          <option value="">Метрика: все</option>
-          <option value="cpu_delta">CPU Δ</option>
-          <option value="rss">RSS</option>
-          <option value="io_delta">IO Δ</option>
-          <option value="net_conn_count">NET_conn_count</option>
-        </select>
+      <select id="alSeverity">
+        <option value="">Уровень: все</option>
+        <option value="low">Низкий</option>
+        <option value="med">Средний</option>
+        <option value="high">Высокий</option>
+      </select>
 
+      <select id="alEntityType">
+        <option value="">Сущность: все</option>
+        <option value="process_session">сессия процесса</option>
+        <option value="process_chain">цепочка процессов</option>
+      </select>
 
-        <button id="anRefresh" style="padding:6px 10px; border-radius:999px; border:1px solid #ddd; cursor:pointer;">Обновить</button>
-      </div>
-      <div id="anOut"></div>
-    `;
+      <select id="alRuleType">
+        <option value="">Правило: все</option>
+        <option value="rarity">редкость</option>
+        <option value="chain">цепочка</option>
+        <option value="time">время</option>
+        <option value="resources">ресурсы</option>
+        <option value="combined">комбинированное</option>
+      </select>
 
-    const sel = byId("anHostSel");
-    const out = byId("anOut");
-    const btn = byId("anRefresh");
-    if (!sel || !out || !btn) return;
+      <button id="anRefresh" style="padding:6px 10px; border-radius:999px; border:1px solid #ddd; cursor:pointer;">Обновить</button>
+    </div>
+    <div id="anOut"></div>
+  `;
 
-    async function loadHosts() {
-      try {
-        const m = await apiGetJson("/api/machines");
-        const items = (m && m.items) ? m.items : [];
-        sel.innerHTML = `<option value="">(все)</option>` + items.map(x => {
-          const name = x.machine_name || "";
-          const alias = x.alias ? ` (${x.alias})` : "";
-          return `<option value="${escapeHtml(name)}">${escapeHtml(name + alias)}</option>`;
-        }).join("");
-      } catch (e) {
-        out.innerHTML = `<div class="error">Не удалось загрузить хосты: ${escapeHtml(e.message || String(e))}</div>`;
-      }
-    }
+  const out = byId("anOut");
+  const hostSel = byId("anHostSel");
+  const procSel = byId("anProcessSel");
+  const profileTypeSel = byId("anProfileType");
 
-        function isoSinceFromPeriod(p) {
-      const now = Date.now();
-      let ms = 7 * 24 * 3600 * 1000;
-      if (p === "24h") ms = 24 * 3600 * 1000;
-      if (p === "30d") ms = 30 * 24 * 3600 * 1000;
-      return new Date(now - ms).toISOString();
-    }
-
-    function fmtMetric(m) {
-      return (m || "").toString();
-    }
-
-    function fmtScore(v) {
-      if (v == null) return "—";
-      const n = Number(v);
-      if (!isFinite(n)) return "—";
-      return n.toFixed(2);
-    }
-
-    async function loadAlerts() {
-      const period = byId("alPeriod")?.value || "7d";
-      const since = isoSinceFromPeriod(period);
-
-      const status = byId("alStatus")?.value || "";
-      const severity = byId("alSeverity")?.value || "";
-      const metric = byId("alMetric")?.value || "";
-
-      const q = new URLSearchParams();
-      q.set("since", since);
-      if (status) q.set("status", status);
-      if (severity) q.set("severity", severity);
-      if (metric) q.set("metric", metric);
-      q.set("limit", "200");
-      q.set("offset", "0");
-
-      const data = await apiGetJson(`/api/alerts?${q.toString()}`);
-      const items = (data && data.items) ? data.items : [];
-
-      const html = `
-        <div class="card" style="margin-bottom:12px;">
-          <h3 style="margin-top:0;">Всплески активности</h3>
-          <div class="muted" style="margin:-6px 0 10px 0;">Показано: ${items.length}${(data && data.total != null) ? ` / total: ${escapeHtml(data.total)}` : ""}</div>
-          <div class="tableWrap"><table>
-            <thead>
-              <tr>
-                <th>Время среза</th><th>Уровень</th><th>Метрика</th>
-                <th>Процесс</th><th>Пользователь</th><th>Компьютер</th>
-                <th>Значение</th><th>Норма</th><th>Оценка отклонения</th>
-                <th>Причина</th><th>Статус</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${
-                items.map(a => `
-                  <tr>
-                    <td class="mono">${escapeHtml(fmtLocalTs(a.sample_time || ""))}</td>
-                    <td><span class="pill ${(a.severity==='high')?'warn':''}">${escapeHtml(a.severity || "")}</span></td>
-                    <td class="mono">${escapeHtml(fmtMetric(a.metric))}</td>
-                    <td>${escapeHtml(a.process_name || "")}</td>
-                    <td>${escapeHtml(a.user_name || "")}</td>
-                    <td>${escapeHtml(a.machine_name || "")}</td>
-                    <td class="mono">${escapeHtml((a.value ?? "").toString())}</td>
-                    <td class="mono">${escapeHtml((a.baseline ?? "—").toString())}</td>
-                    <td class="mono">${escapeHtml(fmtScore(a.score))}</td>
-                    <td class="mono" style="max-width:520px; white-space:pre-wrap;">${escapeHtml(a.reason || "")}</td>
-                    <td>${escapeHtml(a.status || "")}</td>
-                  </tr>
-                `).join("")
-                || `<tr><td colspan="11" class="muted">Нет данных</td></tr>`
-              }
-            </tbody>
-          </table></div>
-        </div>
-      `;
-      return html;
-    }
-
-
-    async function loadRare() {
-      try {
-        const days = Number(byId("anDays")?.value || 14) || 14;
-        const showSha = !!root.querySelector("#anaShowSha")?.checked;
-        const data = await apiGetJson(`/api/analytics/rare?days=${encodeURIComponent(days)}&limit=50`);
-        const bins = (data && data.rare_binaries) ? data.rare_binaries : [];
-        const chains = (data && data.rare_chains) ? data.rare_chains : [];
-        const alertsHtml = await loadAlerts();
-
-        out.innerHTML = `
-          ${alertsHtml}
-          <div class="row">
-
-            <div class="card">
-              <h3 style="margin-top:0;">Редкие исполняемые файлы</h3>
-              <div class="tableWrap"><table>
-                <thead><tr><th>Процесс</th><th>Образцов</th><th>Компьютеров</th><th>Имена компьютеров</th></tr></thead>
-                <tbody>
-                  ${bins.map(b => `<tr>
-                    <td class="mono">${escapeHtml(fmtBinLabel(b, showSha))}</td>
-                    <td>${escapeHtml(b.rows ?? "")}</td>
-                    <td>${escapeHtml(b.machines ?? "")}</td>
-                    <td class="mono" style="max-width:420px; white-space:pre-wrap;">${escapeHtml((b.machine_names ?? "").toString())}</td>
-                    </tr>`).join("") || `<tr><td colspan="4" class="muted">Нет данных</td></tr>`}
-                </tbody>
-              </table></div>
-            </div>
-
-            <div class="card">
-              <h3 style="margin-top:0;">Редкие цепочки запусков</h3>
-              <div class="tableWrap"><table>
-                <thead><tr><th>Цепочка</th><th>Сессий</th><th>Компьютеров</th><th>Имена компьютеров</th></tr></thead>
-                <tbody>
-                  ${chains.map(c => `<tr>
-                    <td class="mono">${escapeHtml(fmtChainLabel(c, showSha))}</td>
-                    <td>${escapeHtml(c.rows ?? "")}</td>
-                    <td>${escapeHtml(c.machines ?? "")}</td>
-                    <td class="mono" style="max-width:420px; white-space:pre-wrap;">${escapeHtml((c.machine_names ?? "").toString())}</td>
-                  </tr>`).join("") || `<tr><td colspan="4" class="muted">Нет данных</td></tr>`}
-                </tbody>
-              </table></div>
-            </div>
-          </div>
-        `;
-      } catch (e) {
-        out.innerHTML = `<div class="error">Ошибка аналитики: ${escapeHtml(e.message || String(e))}</div>`;
-      }
-    }
-
-    async function loadHostProfile() {
-      const host = sel.value || "";
-      if (!host) return;
-      try {
-        const days = Number(byId("anDays")?.value || 14) || 14;
-        const data = await apiGetJson(`/api/analytics/host-profile?machine_name=${encodeURIComponent(host)}&days=${encodeURIComponent(days)}&limit=100`);
-        const items = data.items || [];
-        out.innerHTML = `
-          <div class="card">
-            <h3 style="margin-top:0;">Профиль хоста: ${escapeHtml(host)}</h3>
-            <div class="tableWrap"><table>
-              <thead><tr><th>Имя процесса</th><th>Запусков</th><th>Дней активности</th><th>Средняя длительность</th></tr></thead>
-              <tbody>
-                ${items.map(x => `<tr>
-                  <td><b>${escapeHtml(x.process_name || "")}</b></td>
-                  <td class="muted">${escapeHtml(x.runs ?? "")}</td>
-                  <td class="muted">${escapeHtml(x.seen_days ?? "")}</td>
-                  <td class="muted">${escapeHtml(fmtDuration(Number(x.avg_duration_s ?? 0)))}</td>
-                </tr>`).join("") || `<tr><td colspan="4" class="muted">Нет данных</td></tr>`}
-              </tbody>
-            </table></div>
-          </div>
-        `;
-      } catch (e) {
-        out.innerHTML = `<div class="error">Ошибка профиля: ${escapeHtml(e.message || String(e))}</div>`;
-      }
-    }
-
-    btn.addEventListener("click", async () => {
-      if (sel.value) await loadHostProfile();
-      else await loadRare();
-    });
-
-    sel.addEventListener("change", async () => {
-      if (sel.value) await loadHostProfile();
-      else await loadRare();
-    });
-
-    await loadHosts();
-    await loadRare();
+  function isoSinceFromPeriod(p) {
+    const now = Date.now();
+    let ms = 7 * 24 * 3600 * 1000;
+    if (p === "24h") ms = 24 * 3600 * 1000;
+    if (p === "30d") ms = 30 * 24 * 3600 * 1000;
+    return new Date(now - ms).toISOString();
   }
+
+  function fmtScore(v) {
+    if (v == null) return "—";
+    const n = Number(v);
+    return isFinite(n) ? n.toFixed(2) : "—";
+  }
+
+  function alertRuleGroup(a) {
+    const m = (a.metric || "").toString();
+    const reason = (a.reason || "").toString().toLowerCase();
+    if (reason.includes("[combined]")) return "combined";
+    if (m === "rarity") return "rarity";
+    if (m === "chain_rarity" || m === "chain_anomaly") return "chain";
+    if (m === "time_anomaly") return "time";
+    return "resources";
+  }
+
+  function alertEntityName(a) {
+    if (a.entity_type === "process_chain") {
+      return `${a.parent_process_name || "unknown"} -> ${a.process_name || ""}`;
+    }
+    return a.process_name || "";
+  }
+
+  async function loadHosts() {
+    const m = await apiGetJson("/api/machines");
+    const items = (m && m.items) ? m.items : [];
+    hostSel.innerHTML = `<option value="">(все)</option>` + items.map(x => {
+      const name = x.machine_name || "";
+      const alias = x.alias ? ` (${x.alias})` : "";
+      return `<option value="${escapeHtml(name)}">${escapeHtml(name + alias)}</option>`;
+    }).join("");
+  }
+
+  async function loadProcesses() {
+    const data = await apiGetJson("/api/analytics/process-names?limit=200");
+    const items = data.items || [];
+    procSel.innerHTML = `<option value="">(выберите процесс)</option>` + items.map(x =>
+      `<option value="${escapeHtml(x.process_name || "")}">${escapeHtml(x.process_name || "")}</option>`
+    ).join("");
+  }
+
+  async function loadAlerts() {
+    const q = new URLSearchParams();
+    q.set("since", isoSinceFromPeriod(byId("alPeriod")?.value || "7d"));
+    if (byId("alStatus")?.value) q.set("status", byId("alStatus").value);
+    if (byId("alSeverity")?.value) q.set("severity", byId("alSeverity").value);
+    if (byId("alEntityType")?.value) q.set("entity_type", byId("alEntityType").value);
+    q.set("limit", "200");
+    q.set("offset", "0");
+
+    const data = await apiGetJson(`/api/alerts?${q.toString()}`);
+    let items = data.items || [];
+
+    const ruleType = byId("alRuleType")?.value || "";
+    if (ruleType) {
+      items = items.filter(a => alertRuleGroup(a) === ruleType);
+    }
+
+    return `
+      <div class="card" style="margin-bottom:12px;">
+        <h3 style="margin-top:0;">Оповещения</h3>
+        <div class="muted" style="margin:-6px 0 10px 0;">Показано: ${items.length}${(data && data.total != null) ? ` / Всего: ${escapeHtml(data.total)}` : ""}</div>
+        <div class="tableWrap"><table>
+          <thead>
+            <tr>
+              <th>Время</th><th>Уровень</th><th>Сущность</th><th>Правило</th>
+              <th>Процесс / цепочка</th><th>Пользователь</th><th>Машина</th>
+              <th>Значение</th><th>Базовое значение</th><th>Оценка</th><th>Причина</th><th>Статус</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${
+              items.map(a => `
+                <tr>
+                  <td class="mono">${escapeHtml(fmtLocalTs(a.sample_time || ""))}</td>
+                  <td><span class="pill ${(a.severity==='high')?'warn':''}">${escapeHtml(a.severity || "")}</span></td>
+                  <td>${escapeHtml(a.entity_type || "")}</td>
+                  <td>${escapeHtml(alertRuleGroup(a))}</td>
+                  <td>${escapeHtml(alertEntityName(a))}</td>
+                  <td>${escapeHtml(a.user_name || "")}</td>
+                  <td>${escapeHtml(a.machine_name || "")}</td>
+                  <td class="mono">${escapeHtml((a.value ?? "—").toString())}</td>
+                  <td class="mono">${escapeHtml((a.baseline ?? "—").toString())}</td>
+                  <td class="mono">${escapeHtml(fmtScore(a.score))}</td>
+                  <td class="mono" style="max-width:520px; white-space:pre-wrap;">${escapeHtml(a.reason || "")}</td>
+                  <td>${escapeHtml(a.status || "")}</td>
+                </tr>
+              `).join("") || `<tr><td colspan="12" class="muted">Нет данных</td></tr>`
+            }
+          </tbody>
+        </table></div>
+      </div>
+    `;
+  }
+
+  async function loadMachineProfile() {
+    const host = hostSel.value || "";
+    if (!host) return `<div class="card"><div class="muted">Выберите хост</div></div>`;
+    const days = Number(byId("anDays")?.value || 14) || 14;
+    const data = await apiGetJson(`/api/analytics/host-profile?machine_name=${encodeURIComponent(host)}&days=${encodeURIComponent(days)}&limit=100`);
+    const items = data.items || [];
+    return `
+      <div class="card">
+        <h3 style="margin-top:0;">Профиль хоста: ${escapeHtml(host)}</h3>
+        <div class="tableWrap"><table>
+          <thead><tr><th>Процесс</th><th>Запусков</th><th>Дней</th><th>Средняя длительность</th></tr></thead>
+          <tbody>
+            ${items.map(x => `<tr>
+              <td><b>${escapeHtml(x.process_name || "")}</b></td>
+              <td>${escapeHtml(x.runs ?? "")}</td>
+              <td>${escapeHtml(x.seen_days ?? "")}</td>
+              <td>${escapeHtml(fmtDuration(Number(x.avg_duration_s ?? 0)))}</td>
+            </tr>`).join("") || `<tr><td colspan="4" class="muted">Нет данных</td></tr>`}
+          </tbody>
+        </table></div>
+      </div>
+    `;
+  }
+
+  async function loadProcessProfile() {
+    const pname = procSel.value || "";
+    if (!pname) return `<div class="card"><div class="muted">Выберите процесс</div></div>`;
+    const days = Number(byId("anDays")?.value || 14) || 14;
+    const data = await apiGetJson(`/api/analytics/process-profile?process_name=${encodeURIComponent(pname)}&days=${encodeURIComponent(days)}`);
+    const items = data.items || [];
+    return `
+      <div class="card">
+        <h3 style="margin-top:0;">Профиль процесса: ${escapeHtml(pname)}</h3>
+        <div class="tableWrap"><table>
+          <thead>
+            <tr>
+              <th>Машина</th><th>Пользователь</th><th>Уникальных сессий</th><th>Дней</th>
+              <th>Типичные часы</th><th>Медианный RSS</th><th>Медианное CPU Δ</th><th>Медианное IO Δ</th><th>Сетевых сессий</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${items.map(x => `<tr>
+              <td>${escapeHtml(x.machine_name || "")}</td>
+              <td>${escapeHtml(x.user_name || "")}</td>
+              <td>${escapeHtml(x.runs ?? "")}</td>
+              <td>${escapeHtml(x.seen_days ?? "")}</td>
+              <td>${escapeHtml(x.typical_hours || "—")}</td>
+              <td>${escapeHtml(fmtBytes(x.median_rss))}</td>
+              <td>${escapeHtml((x.median_cpu_delta ?? "—").toString())}</td>
+              <td>${escapeHtml((x.median_io_delta ?? "—").toString())}</td>
+              <td>${escapeHtml(x.net_sessions ?? "")}</td>
+            </tr>`).join("") || `<tr><td colspan="9" class="muted">Нет данных</td></tr>`}
+          </tbody>
+        </table></div>
+      </div>
+    `;
+  }
+
+  async function refreshAnalytics() {
+    try {
+      const alertsHtml = await loadAlerts();
+      let profileHtml = "";
+      if (profileTypeSel.value === "machine") profileHtml = await loadMachineProfile();
+      if (profileTypeSel.value === "process") profileHtml = await loadProcessProfile();
+      out.innerHTML = alertsHtml + profileHtml;
+    } catch (e) {
+      out.innerHTML = `<div class="error">Ошибка аналитики: ${escapeHtml(e.message || String(e))}</div>`;
+    }
+  }
+
+  byId("anRefresh").addEventListener("click", refreshAnalytics);
+  profileTypeSel.addEventListener("change", refreshAnalytics);
+  hostSel.addEventListener("change", refreshAnalytics);
+  procSel.addEventListener("change", refreshAnalytics);
+
+  await loadHosts();
+  await loadProcesses();
+  await refreshAnalytics();
+}
 
   // Settings tab
 

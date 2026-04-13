@@ -85,6 +85,14 @@ def _safe_parse_iso(s: Optional[str]) -> Optional[datetime]:
     except Exception:
         return None
 
+def _local_hour_from_iso(s: Optional[str]) -> Optional[int]:
+    dt = _safe_parse_iso(s)
+    if not dt:
+        return None
+    try:
+        return int(dt.astimezone().hour)
+    except Exception:
+        return int(dt.hour)
 
 def db_connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -248,6 +256,9 @@ def ensure_schema() -> None:
 
             machine_name TEXT NOT NULL,
             user_name TEXT NOT NULL,
+
+            entity_type TEXT NOT NULL,          -- process_session | process_chain
+
             process_name TEXT NOT NULL,
             pid INTEGER,
             start_time TEXT,
@@ -255,23 +266,40 @@ def ensure_schema() -> None:
             sha256 TEXT,
             exe_path TEXT,
 
-            metric TEXT NOT NULL,              -- cpu_delta | rss | io_delta | net_conn_count
-            value REAL NOT NULL,
+            parent_process_name TEXT,
+            parent_sha256 TEXT,
+            parent_exe_path TEXT,
+            chain_key TEXT,
+
+            metric TEXT NOT NULL,               -- cpu_delta | io_delta | rss | net_conn_count | rarity | chain_rarity | time_anomaly
+            value REAL,
             baseline REAL,
-            score REAL,                        -- ratio (or NULL)
-            severity TEXT NOT NULL,            -- low | med | high
+            score REAL,
+            severity TEXT NOT NULL,
             reason TEXT NOT NULL,
 
-            status TEXT NOT NULL DEFAULT 'new', -- new | ack | closed
+            status TEXT NOT NULL DEFAULT 'new',
             ack_by TEXT,
             ack_at TEXT,
             closed_at TEXT,
 
-            bucket_hour TEXT NOT NULL,         -- YYYY-MM-DDTHH
+            bucket_hour TEXT NOT NULL,
             dedup_key TEXT NOT NULL
         );
         """
     )
+    cur.execute("PRAGMA table_info(alerts);")
+    alert_cols = {row[1] for row in cur.fetchall()}
+    if "entity_type" not in alert_cols:
+        cur.execute("ALTER TABLE alerts ADD COLUMN entity_type TEXT;")
+    if "parent_process_name" not in alert_cols:
+        cur.execute("ALTER TABLE alerts ADD COLUMN parent_process_name TEXT;")
+    if "parent_sha256" not in alert_cols:
+        cur.execute("ALTER TABLE alerts ADD COLUMN parent_sha256 TEXT;")
+    if "parent_exe_path" not in alert_cols:
+        cur.execute("ALTER TABLE alerts ADD COLUMN parent_exe_path TEXT;")
+    if "chain_key" not in alert_cols:
+        cur.execute("ALTER TABLE alerts ADD COLUMN chain_key TEXT;")
 
     # indexes for speed
     cur.execute("CREATE INDEX IF NOT EXISTS idx_alerts_created_at ON alerts(created_at);")
@@ -281,6 +309,8 @@ def ensure_schema() -> None:
     cur.execute("CREATE INDEX IF NOT EXISTS idx_alerts_user_time ON alerts(user_name, created_at);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_alerts_metric_time ON alerts(metric, created_at);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_alerts_sha_time ON alerts(sha256, created_at);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_alerts_entity_metric_time ON alerts(entity_type, metric, created_at);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_alerts_chain_time ON alerts(chain_key, created_at);")
 
     # strict hourly dedup
     cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_alerts_dedup_key ON alerts(dedup_key);")
@@ -433,7 +463,7 @@ def _startup() -> None:
 
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
-    refresh_seconds = int(_cfg_get("refresh_seconds", 120))
+    refresh_seconds = int(_cfg_get("refresh_seconds", _cfg_get("web_refresh_seconds", 120)))
     build_id = str(int(time.time()))
     return templates.TemplateResponse(
         "dashboard.html",
@@ -462,11 +492,11 @@ def ingest(payload: List[Dict[str, Any]] = Body(...), x_api_key: Optional[str] =
     # Alerts detector (MVP): server-side, consistent across devices
     try:
         alerts_inserted = detect_alerts_for_ingested_events(events)
-    except Exception:
+    except Exception as e:
+        print(f"[ingest] alerts detector error: {type(e).__name__}: {e}", file=sys.stderr)
         alerts_inserted = 0
 
     return {"ok": True, **res, "alerts_inserted": int(alerts_inserted)}
-
 
 def _latest_samples_by_session(cur: sqlite3.Cursor, machine: str, since_iso: str) -> List[sqlite3.Row]:
     cur.execute(
@@ -973,25 +1003,27 @@ def _collect_baseline_values(
     vals: List[float] = []
 
     if metric in ("rss", "net_conn_count"):
+        metric_col = "rss_bytes" if metric == "rss" else "net_conn_count"
+
         if use_sha:
             cur.execute(
                 f"""
-                SELECT {metric} AS v
+                SELECT {metric_col} AS v
                 FROM events
                 WHERE user_name=? AND NULLIF(sha256,'') IS NOT NULL AND sha256=?
                   AND sample_time>=? AND sample_time<?
-                  AND {metric} IS NOT NULL
+                  AND {metric_col} IS NOT NULL
                 """,
                 (user_name, sha256, since_iso, until_iso),
             )
         else:
             cur.execute(
                 f"""
-                SELECT {metric} AS v
+                SELECT {metric_col} AS v
                 FROM events
                 WHERE user_name=? AND (sha256 IS NULL OR sha256='') AND exe_path=?
                   AND sample_time>=? AND sample_time<?
-                  AND {metric} IS NOT NULL
+                  AND {metric_col} IS NOT NULL
                 """,
                 (user_name, exe_path, since_iso, until_iso),
             )
@@ -1069,7 +1101,6 @@ def _collect_baseline_values(
 
     return vals
 
-
 def _severity_from_ratio(ratio: Optional[float]) -> str:
     if ratio is None:
         return "med"
@@ -1080,37 +1111,60 @@ def _severity_from_ratio(ratio: Optional[float]) -> str:
     return "low"
 
 
-def _try_insert_alert(
-    cur: sqlite3.Cursor,
-    alert: Dict[str, Any],
-) -> bool:
-    """
-    Inserts alert with hourly dedup. Returns True if inserted.
-    """
+def _raise_severity(current: str, target: str) -> str:
+    order = {"low": 0, "med": 1, "high": 2}
+    return target if order.get(target, 1) > order.get(current, 1) else current
+
+
+def _binary_key(sha256: Optional[str], exe_path: Optional[str], process_name: str) -> str:
+    s = (sha256 or "").strip()
+    if s:
+        return s
+    p = (exe_path or "").strip().lower()
+    if p:
+        return f"path:{p}"
+    return f"name:{(process_name or 'unknown').strip().lower()}"
+
+
+def _make_alert_dedup_key(alert: Dict[str, Any]) -> str:
+    if alert["entity_type"] == "process_chain":
+        return f"{alert['machine_name']}|{alert['user_name']}|{alert.get('chain_key') or ''}|{alert['metric']}|{alert['bucket_hour']}"
+    return f"{alert['machine_name']}|{alert['user_name']}|{_binary_key(alert.get('sha256'), alert.get('exe_path'), alert.get('process_name') or '')}|{alert['metric']}|{alert['bucket_hour']}"
+
+
+def _try_insert_alert(cur: sqlite3.Cursor, alert: Dict[str, Any]) -> bool:
     try:
         cur.execute(
             """
             INSERT OR IGNORE INTO alerts(
                 created_at, sample_time,
-                machine_name, user_name, process_name, pid, start_time,
+                machine_name, user_name,
+                entity_type,
+                process_name, pid, start_time,
                 sha256, exe_path,
+                parent_process_name, parent_sha256, parent_exe_path, chain_key,
                 metric, value, baseline, score, severity, reason,
                 status, ack_by, ack_at, closed_at,
                 bucket_hour, dedup_key
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 alert["created_at"],
                 alert["sample_time"],
                 alert["machine_name"],
                 alert["user_name"],
+                alert["entity_type"],
                 alert["process_name"],
                 alert.get("pid"),
                 alert.get("start_time"),
                 alert.get("sha256"),
                 alert.get("exe_path"),
+                alert.get("parent_process_name"),
+                alert.get("parent_sha256"),
+                alert.get("parent_exe_path"),
+                alert.get("chain_key"),
                 alert["metric"],
-                float(alert["value"]),
+                alert.get("value"),
                 alert.get("baseline"),
                 alert.get("score"),
                 alert["severity"],
@@ -1128,28 +1182,251 @@ def _try_insert_alert(
         return False
 
 
+def _load_parent_context(cur: sqlite3.Cursor, latest: sqlite3.Row) -> Optional[Dict[str, Any]]:
+    machine = str(latest["machine_name"] or "")
+    ppid = latest["ppid"]
+    if ppid is None:
+        return None
+
+    child_start = _safe_parse_iso(str(latest["start_time"]))
+    child_sample = _safe_parse_iso(str(latest["sample_time"]))
+    if not child_sample:
+        return None
+
+    cur.execute(
+        """
+        SELECT *
+        FROM events
+        WHERE machine_name=? AND pid=?
+          AND sample_time<=?
+        ORDER BY sample_time DESC
+        LIMIT 20
+        """,
+        (machine, int(ppid), str(latest["sample_time"])),
+    )
+
+    candidates = cur.fetchall()
+    if not candidates:
+        return None
+
+    parent = None
+    for cand in candidates:
+        cand_start = _safe_parse_iso(str(cand["start_time"]))
+        cand_end = _safe_parse_iso(str(cand["end_time"])) if cand["end_time"] else None
+
+        if child_start and cand_start and cand_start > child_start:
+            continue
+        if child_start and cand_end and cand_end < child_start:
+            continue
+
+        parent = cand
+        break
+
+    if not parent:
+        parent = candidates[0]
+
+    parent_key = _binary_key(parent["sha256"], parent["exe_path"], str(parent["process_name"] or ""))
+    child_key = _binary_key(latest["sha256"], latest["exe_path"], str(latest["process_name"] or ""))
+
+    return {
+        "parent_process_name": str(parent["process_name"] or ""),
+        "parent_sha256": str(parent["sha256"] or "").strip() or None,
+        "parent_exe_path": str(parent["exe_path"] or "").strip() or None,
+        "chain_key": f"{parent_key} -> {child_key}",
+        "parent_key": parent_key,
+        "child_key": child_key,
+    }
+
+def _count_prior_binary_sessions(
+    cur: sqlite3.Cursor,
+    machine: str,
+    user_name: str,
+    pid: int,
+    start_time: str,
+    sample_time: str,
+    sha256: str,
+    exe_path: str,
+    process_name: str,
+) -> int:
+    params: List[Any] = [machine, sample_time, machine, int(pid), start_time]
+
+    if sha256:
+        match_sql = "NULLIF(sha256, '') IS NOT NULL AND sha256=?"
+        params.append(sha256)
+    elif exe_path:
+        match_sql = "lower(COALESCE(exe_path, ''))=?"
+        params.append(exe_path.lower())
+    else:
+        match_sql = "lower(process_name)=?"
+        params.append(process_name.lower())
+
+    user_sql = ""
+    if user_name:
+        user_sql = " AND COALESCE(user_name, '')=?"
+        params.append(user_name)
+
+    cur.execute(
+        f"""
+        SELECT COUNT(DISTINCT machine_name || '|' || COALESCE(pid, '') || '|' || start_time) AS c
+        FROM events
+        WHERE machine_name=?
+          AND sample_time < ?
+          AND NOT (machine_name=? AND COALESCE(pid, 0)=? AND start_time=?)
+          AND {match_sql}
+          {user_sql}
+        """,
+        params,
+    )
+    row = cur.fetchone()
+    return int((row["c"] if row else 0) or 0)
+
+def _count_prior_chain_sessions(
+    cur: sqlite3.Cursor,
+    machine: str,
+    user_name: str,
+    pid: int,
+    start_time: str,
+    sample_time: str,
+    parent_key: str,
+    child_key: str,
+) -> int:
+    params: List[Any] = [machine, sample_time, machine, int(pid), start_time]
+
+    user_sql = ""
+    if user_name:
+        user_sql = " AND COALESCE(c.user_name, '')=?"
+        params.append(user_name)
+
+    cur.execute(
+        f"""
+        WITH child_sessions AS (
+          SELECT
+              machine_name,
+              COALESCE(user_name, '') AS user_name,
+              pid,
+              ppid,
+              start_time,
+              sample_time,
+              end_time,
+              COALESCE(NULLIF(sha256, ''), 'path:' || lower(COALESCE(exe_path, '')), 'name:' || lower(process_name)) AS child_key
+          FROM events
+          WHERE machine_name=?
+            AND sample_time < ?
+            AND NOT (machine_name=? AND COALESCE(pid, 0)=? AND start_time=?)
+          GROUP BY machine_name, pid, start_time
+        ),
+        parent_candidates AS (
+          SELECT
+              machine_name,
+              pid,
+              start_time,
+              end_time,
+              sample_time,
+              COALESCE(NULLIF(sha256, ''), 'path:' || lower(COALESCE(exe_path, '')), 'name:' || lower(process_name)) AS parent_key
+          FROM events
+        )
+        SELECT COUNT(DISTINCT c.machine_name || '|' || COALESCE(c.pid, '') || '|' || c.start_time) AS c
+        FROM child_sessions c
+        JOIN parent_candidates p
+          ON p.machine_name = c.machine_name
+         AND p.pid = c.ppid
+         AND p.start_time <= c.start_time
+         AND (p.end_time IS NULL OR p.end_time = '' OR p.end_time >= c.start_time)
+        WHERE c.child_key=?
+          AND p.parent_key=?
+          {user_sql}
+        """,
+        params + [child_key, parent_key],
+    )
+    row = cur.fetchone()
+    return int((row["c"] if row else 0) or 0)
+
+
+def _typical_hours_for_process(
+    cur: sqlite3.Cursor,
+    machine: str,
+    user_name: str,
+    pid: int,
+    start_time: str,
+    sample_time: str,
+    sha256: str,
+    exe_path: str,
+    process_name: str,
+) -> Tuple[set, int]:
+    min_samples = int(_cfg_get("time_hist_min_samples", TIME_HIST_MIN_SAMPLES_DEFAULT))
+    params: List[Any] = [machine, sample_time, machine, int(pid), start_time]
+
+    if sha256:
+        match_sql = "NULLIF(sha256, '') IS NOT NULL AND sha256=?"
+        params.append(sha256)
+    elif exe_path:
+        match_sql = "lower(COALESCE(exe_path, ''))=?"
+        params.append(exe_path.lower())
+    else:
+        match_sql = "lower(process_name)=?"
+        params.append(process_name.lower())
+
+    user_sql = ""
+    if user_name:
+        user_sql = " AND COALESCE(user_name, '')=?"
+        params.append(user_name)
+
+    cur.execute(
+        f"""
+        WITH sessions AS (
+          SELECT
+              start_time,
+              machine_name || '|' || COALESCE(pid, '') || '|' || start_time AS session_key
+          FROM events
+          WHERE machine_name=?
+            AND sample_time < ?
+            AND NOT (machine_name=? AND COALESCE(pid, 0)=? AND start_time=?)
+            AND {match_sql}
+            {user_sql}
+          GROUP BY machine_name, pid, start_time
+        )
+        SELECT start_time
+        FROM sessions
+        """,
+        params,
+    )
+
+    hist: Dict[int, int] = {}
+    total = 0
+    for r in cur.fetchall():
+        hh = _local_hour_from_iso(r["start_time"])
+        if hh is None:
+            continue
+        hist[hh] = hist.get(hh, 0) + 1
+        total += 1
+
+    if total < min_samples or not hist:
+        return set(), total
+
+    peak = max(hist.values())
+    thr = max(2, int((peak * 0.5) + 0.9999))
+    typical = {hh for hh, cnt in hist.items() if cnt >= thr and cnt >= 2}
+    return typical, total
+
+
 def detect_alerts_for_ingested_events(events_payload: List[Dict[str, Any]]) -> int:
-    """
-    MVP mode: run after ingest for the newest sample_time per session found in payload.
-    Heavy work is limited to per-session and per-(user,binary,metric) baseline windows.
-    """
     if not events_payload:
         return 0
 
-    # collect newest sample_time per session_key from payload
     newest: Dict[Tuple[str, int, str], str] = {}
     for e in events_payload:
         try:
-            m = str(e.get("machine_name") or "").strip()
-            pid = int(e.get("pid") or 0)
-            st = str(e.get("start_time") or "").strip()
+            key = (
+                str(e.get("machine_name") or "").strip(),
+                int(e.get("pid") or 0),
+                str(e.get("start_time") or "").strip(),
+            )
             sm = str(e.get("sample_time") or "").strip()
-            if not (m and pid and st and sm):
+            if not (key[0] and key[1] and key[2] and sm):
                 continue
-            k = (m, pid, st)
-            prev = newest.get(k)
-            if (not prev) or (str(sm) > str(prev)):
-                newest[k] = sm
+            prev = newest.get(key)
+            if (not prev) or sm > prev:
+                newest[key] = sm
         except Exception:
             continue
 
@@ -1159,11 +1436,12 @@ def detect_alerts_for_ingested_events(events_payload: List[Dict[str, Any]]) -> i
     now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
     days = int(_cfg_get("alert_baseline_window_days", ALERT_BASELINE_WINDOW_DAYS_DEFAULT))
     nmin = int(_cfg_get("alert_baseline_min_points", ALERT_BASELINE_MIN_POINTS_DEFAULT))
+    rare_thr = int(_cfg_get("rare_count_threshold", RARE_COUNT_THRESHOLD_DEFAULT))
 
     conn = db_connect()
     cur = conn.cursor()
-
     inserted = 0
+
     for (machine, pid, start_time), current_sample in newest.items():
         latest, prev = _get_latest_and_prev_for_session(cur, machine, pid, start_time, current_sample)
         if not latest:
@@ -1174,69 +1452,38 @@ def detect_alerts_for_ingested_events(events_payload: List[Dict[str, Any]]) -> i
         exe_path = str(latest["exe_path"] or "").strip()
         sha256 = str(latest["sha256"] or "").strip()
 
-        # binary identity + fallback marker
-        bin_id = sha256 if sha256 else exe_path
-        sha_missing = not bool(sha256)
-
-        # baseline window bounds
         until_iso = str(latest["sample_time"])
         since_dt = _safe_parse_iso(until_iso)
-        if since_dt:
-            since_iso = (since_dt - timedelta(days=days)).isoformat(timespec="seconds")
-        else:
-            since_iso, _ = _window_bounds(days)
+        since_iso = (since_dt - timedelta(days=days)).isoformat(timespec="seconds") if since_dt else _window_bounds(days)[0]
 
-        # compute metric current values
+        bucket_hour = _bucket_hour_from_sample(until_iso)
+        session_alerts: List[Dict[str, Any]] = []
+
         cpu_delta_val = None
         io_delta_val = None
         if prev:
             try:
-                cu = latest["cpu_user_time_s"]
-                cs = latest["cpu_system_time_s"]
-                pu = prev["cpu_user_time_s"]
-                ps = prev["cpu_system_time_s"]
-                if cu is not None or cs is not None:
-                    cur_tot = float(cu or 0.0) + float(cs or 0.0)
-                    prev_tot = float(pu or 0.0) + float(ps or 0.0)
-                    cpu_delta_val = float(max(0.0, cur_tot - prev_tot))
+                cpu_delta_val = max(
+                    0.0,
+                    (float(latest["cpu_user_time_s"] or 0.0) + float(latest["cpu_system_time_s"] or 0.0)) -
+                    (float(prev["cpu_user_time_s"] or 0.0) + float(prev["cpu_system_time_s"] or 0.0))
+                )
             except Exception:
                 cpu_delta_val = None
-
             try:
-                cr = latest["io_read_bytes"]
-                cw = latest["io_write_bytes"]
-                pr = prev["io_read_bytes"]
-                pw = prev["io_write_bytes"]
-                if cr is not None or cw is not None:
-                    cur_tot = float(cr or 0.0) + float(cw or 0.0)
-                    prev_tot = float(pr or 0.0) + float(pw or 0.0)
-                    io_delta_val = float(max(0.0, cur_tot - prev_tot))
+                io_delta_val = max(
+                    0.0,
+                    (float(latest["io_read_bytes"] or 0.0) + float(latest["io_write_bytes"] or 0.0)) -
+                    (float(prev["io_read_bytes"] or 0.0) + float(prev["io_write_bytes"] or 0.0))
+                )
             except Exception:
                 io_delta_val = None
-
-        rss_val = None
-        try:
-            if latest["rss_bytes"] is not None:
-                rss_val = float(latest["rss_bytes"])
-        except Exception:
-            rss_val = None
-
-        net_val = None
-        try:
-            if latest["net_conn_count"] is not None:
-                net_val = float(latest["net_conn_count"])
-        except Exception:
-            net_val = None
-
-        # optional: if net_active is present and false -> skip NET alerting
-        net_active = latest["net_active"]
-        net_skip = (net_active == 0 or net_active is False)
 
         metrics_now: Dict[str, Optional[float]] = {
             "cpu_delta": cpu_delta_val,
             "io_delta": io_delta_val,
-            "rss": rss_val,
-            "net_conn_count": (None if net_skip else net_val),
+            "rss": (float(latest["rss_bytes"]) if latest["rss_bytes"] is not None else None),
+            "net_conn_count": (float(latest["net_conn_count"]) if latest["net_conn_count"] is not None and latest["net_active"] not in (0, False) else None),
         }
 
         for metric, value_now in metrics_now.items():
@@ -1247,11 +1494,6 @@ def detect_alerts_for_ingested_events(events_payload: List[Dict[str, Any]]) -> i
             if not rule:
                 continue
 
-            K = float(rule["K"])
-            abs_thr = float(rule["abs"])
-            very_high_abs = float(rule["very_high_abs"])
-
-            # baseline (median)
             baseline_values = _collect_baseline_values(
                 cur=cur,
                 metric=metric,
@@ -1264,82 +1506,168 @@ def detect_alerts_for_ingested_events(events_payload: List[Dict[str, Any]]) -> i
             baseline = _median(baseline_values)
             ratio = (float(value_now) / float(baseline)) if (baseline is not None and baseline > 0) else None
 
-            # decision:
             fired = False
-            used_mode = ""
             if baseline is not None and len(baseline_values) >= nmin:
-                if (value_now > baseline * K) and (value_now > abs_thr):
-                    fired = True
-                    used_mode = "ratio"
+                fired = value_now > float(baseline) * float(rule["K"]) and value_now > float(rule["abs"])
             else:
-                # baseline insufficient -> only very high absolute threshold
-                if value_now > very_high_abs:
-                    fired = True
-                    used_mode = "abs_only"
+                fired = value_now > float(rule["very_high_abs"])
 
             if not fired:
                 continue
 
-            bucket_hour = _bucket_hour_from_sample(str(latest["sample_time"]))
-            dedup_bin = (sha256 if sha256 else exe_path)
-            dedup_key = f"{machine}|{user_name}|{dedup_bin}|{metric}|{bucket_hour}"
-
-            # reason (explainable)
-            interval_s = None
-            if prev:
-                dt1 = _safe_parse_iso(str(prev["sample_time"]))
-                dt2 = _safe_parse_iso(str(latest["sample_time"]))
-                if dt1 and dt2:
-                    interval_s = int(max(0, (dt2 - dt1).total_seconds()))
-
             reason = (
-                f"metric={metric} value={value_now:.4g} "
-                f"baseline={(baseline if baseline is not None else 'null')} "
-                f"ratio={(ratio if ratio is not None else 'null')} "
-                f"K={K} abs={abs_thr} mode={used_mode}"
+                f"Ресурсная аномалия: {metric}, значение={value_now:.4g}, "
+                f"baseline={(baseline if baseline is not None else 'null')}, "
+                f"ratio={(ratio if ratio is not None else 'null')}."
             )
-            if interval_s is not None:
-                reason += f" interval_s={interval_s}"
-            if sha_missing:
-                reason += " sha256_missing_fallback_exe_path=true"
 
-            sev = _severity_from_ratio(ratio)
-
-            alert_row = {
+            session_alerts.append({
                 "created_at": now_iso,
-                "sample_time": str(latest["sample_time"]),
+                "sample_time": until_iso,
                 "machine_name": machine,
                 "user_name": user_name,
+                "entity_type": "process_session",
                 "process_name": process_name,
                 "pid": int(latest["pid"] or 0) if latest["pid"] is not None else None,
                 "start_time": str(latest["start_time"]) if latest["start_time"] is not None else None,
                 "sha256": sha256 or None,
                 "exe_path": exe_path or None,
+                "parent_process_name": None,
+                "parent_sha256": None,
+                "parent_exe_path": None,
+                "chain_key": None,
                 "metric": metric,
                 "value": float(value_now),
                 "baseline": (float(baseline) if baseline is not None else None),
                 "score": (float(ratio) if ratio is not None else None),
+                "severity": _severity_from_ratio(ratio),
+                "reason": reason,
+                "status": "new",
+                "bucket_hour": bucket_hour,
+            })
+
+        prior_binary_sessions = _count_prior_binary_sessions(
+            cur, machine, user_name, pid, start_time, until_iso, sha256, exe_path, process_name
+        )
+        if prior_binary_sessions <= rare_thr:
+            if prior_binary_sessions == 0:
+                reason = "Процесс ранее не наблюдался на данной машине."
+                sev = "med"
+            else:
+                reason = f"Процесс наблюдался {prior_binary_sessions} раз(а), что ниже порога {rare_thr}."
+                sev = "low"
+
+            session_alerts.append({
+                "created_at": now_iso,
+                "sample_time": until_iso,
+                "machine_name": machine,
+                "user_name": user_name,
+                "entity_type": "process_session",
+                "process_name": process_name,
+                "pid": int(latest["pid"] or 0) if latest["pid"] is not None else None,
+                "start_time": str(latest["start_time"]) if latest["start_time"] is not None else None,
+                "sha256": sha256 or None,
+                "exe_path": exe_path or None,
+                "parent_process_name": None,
+                "parent_sha256": None,
+                "parent_exe_path": None,
+                "chain_key": None,
+                "metric": "rarity",
+                "value": float(prior_binary_sessions),
+                "baseline": float(rare_thr),
+                "score": None,
                 "severity": sev,
                 "reason": reason,
                 "status": "new",
                 "bucket_hour": bucket_hour,
-                "dedup_key": dedup_key,
-            }
+            })
 
+        parent_ctx = _load_parent_context(cur, latest)
+        if parent_ctx:
+            prior_chain_sessions = _count_prior_chain_sessions(
+                cur, machine, user_name, pid, start_time, until_iso, parent_ctx["parent_key"], parent_ctx["child_key"]
+            )
+            if prior_chain_sessions <= rare_thr:
+                if prior_chain_sessions == 0:
+                    reason = "Цепочка parent -> child ранее не наблюдалась."
+                    sev = "med"
+                else:
+                    reason = f"Цепочка встречалась {prior_chain_sessions} раз(а), что ниже порога {rare_thr}."
+                    sev = "low"
+
+                session_alerts.append({
+                    "created_at": now_iso,
+                    "sample_time": until_iso,
+                    "machine_name": machine,
+                    "user_name": user_name,
+                    "entity_type": "process_chain",
+                    "process_name": process_name,
+                    "pid": int(latest["pid"] or 0) if latest["pid"] is not None else None,
+                    "start_time": str(latest["start_time"]) if latest["start_time"] is not None else None,
+                    "sha256": sha256 or None,
+                    "exe_path": exe_path or None,
+                    "parent_process_name": parent_ctx["parent_process_name"],
+                    "parent_sha256": parent_ctx["parent_sha256"],
+                    "parent_exe_path": parent_ctx["parent_exe_path"],
+                    "chain_key": parent_ctx["chain_key"],
+                    "metric": "chain_rarity",
+                    "value": float(prior_chain_sessions),
+                    "baseline": float(rare_thr),
+                    "score": None,
+                    "severity": sev,
+                    "reason": reason,
+                    "status": "new",
+                    "bucket_hour": bucket_hour,
+                })
+
+        typical_hours, hist_size = _typical_hours_for_process(
+            cur, machine, user_name, pid, start_time, until_iso, sha256, exe_path, process_name
+        )
+
+        start_hour_local = _local_hour_from_iso(start_time)
+        if start_hour_local is not None and typical_hours and hist_size >= int(_cfg_get("time_hist_min_samples", TIME_HIST_MIN_SAMPLES_DEFAULT)):
+            if start_hour_local not in typical_hours:
+                hh = ", ".join(f"{x:02d}" for x in sorted(typical_hours))
+                session_alerts.append({
+                    "created_at": now_iso,
+                    "sample_time": until_iso,
+                    "machine_name": machine,
+                    "user_name": user_name,
+                    "entity_type": "process_session",
+                    "process_name": process_name,
+                    "pid": int(latest["pid"] or 0) if latest["pid"] is not None else None,
+                    "start_time": str(latest["start_time"]) if latest["start_time"] is not None else None,
+                    "sha256": sha256 or None,
+                    "exe_path": exe_path or None,
+                    "parent_process_name": None,
+                    "parent_sha256": None,
+                    "parent_exe_path": None,
+                    "chain_key": None,
+                    "metric": "time_anomaly",
+                    "value": float(start_hour_local),
+                    "baseline": None,
+                    "score": None,
+                    "severity": "med",
+                    "reason": f"Запуск произошёл в нетипичный час {start_hour_local:02d}:00. Типичные часы запуска: {hh}.",
+                    "status": "new",
+                    "bucket_hour": bucket_hour,
+                })
+
+        metrics = {a["metric"] for a in session_alerts}
+        if "rarity" in metrics and "chain_rarity" in metrics:
+            for a in session_alerts:
+                if a["metric"] in ("rarity", "chain_rarity"):
+                    a["severity"] = _raise_severity(a["severity"], "high")
+                    a["reason"] = "[combined] Редкий процесс + нетипичная цепочка. " + a["reason"]
+
+        for alert_row in session_alerts:
+            alert_row["dedup_key"] = _make_alert_dedup_key(alert_row)
             if _try_insert_alert(cur, alert_row):
                 inserted += 1
 
     conn.commit()
     conn.close()
     return inserted
-
-
-def _binary_key(sha256: Optional[str], process_name: str) -> str:
-    s = (sha256 or "").strip()
-    if s:
-        return s
-    return f"name:{process_name.lower()}"
-
 
 def _window_bounds(days: int) -> Tuple[str, str]:
     now = datetime.now()
@@ -1553,6 +1881,162 @@ def analytics_host_profile(machine_name: str, x_api_key: Optional[str] = Header(
     conn.close()
     return {"machine_name": machine, "window_days": days, "items": items}
 
+@app.get("/api/analytics/process-names")
+def analytics_process_names(
+    x_api_key: Optional[str] = Header(default=None),
+    q: str = "",
+    limit: int = 100,
+):
+    require_api_key(x_api_key)
+    conn = db_connect()
+    cur = conn.cursor()
+    needle = q.strip().lower()
+
+    cur.execute(
+        """
+        SELECT MIN(process_name) AS process_name, lower(process_name) AS pname, COUNT(*) AS rows_count
+        FROM events
+        WHERE TRIM(COALESCE(process_name, '')) <> ''
+          AND (? = '' OR lower(process_name) LIKE '%' || ? || '%')
+        GROUP BY lower(process_name)
+        ORDER BY rows_count DESC, pname ASC
+        LIMIT ?
+        """,
+        (needle, needle, max(1, min(int(limit), 500))),
+    )
+    items = [{"process_name": r["process_name"]} for r in cur.fetchall()]
+    conn.close()
+    return {"items": items}
+
+
+@app.get("/api/analytics/process-profile")
+def analytics_process_profile(
+    process_name: str,
+    x_api_key: Optional[str] = Header(default=None),
+    days: int = 14,
+):
+    require_api_key(x_api_key)
+    pname = process_name.strip()
+    if not pname:
+        raise HTTPException(status_code=400, detail="process_name required")
+
+    since, _ = _window_bounds(int(days))
+
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT
+            machine_name,
+            COALESCE(user_name, '') AS user_name,
+            pid,
+            start_time,
+            sample_time,
+            rss_bytes,
+            cpu_user_time_s,
+            cpu_system_time_s,
+            io_read_bytes,
+            io_write_bytes,
+            net_active,
+            net_conn_count
+        FROM events
+        WHERE lower(process_name) = lower(?)
+          AND sample_time >= ?
+        ORDER BY machine_name, user_name, pid, start_time, sample_time
+        """,
+        (pname, since),
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+
+    sessions: Dict[Tuple[str, str, int, str], Dict[str, Any]] = {}
+    for r in rows:
+        sk = (str(r["machine_name"]), str(r["user_name"]), int(r["pid"] or 0), str(r["start_time"]))
+        cur_s = sessions.setdefault(sk, {
+            "machine_name": str(r["machine_name"]),
+            "user_name": str(r["user_name"]),
+            "start_time": str(r["start_time"]),
+            "day": (_safe_parse_iso(r["start_time"]).astimezone().date().isoformat() if _safe_parse_iso(r["start_time"]) else str(r["start_time"])[:10]),
+            "hour": _local_hour_from_iso(r["start_time"]),
+            "rss_values": [],
+            "cpu_prev": None,
+            "io_prev": None,
+            "cpu_deltas": [],
+            "io_deltas": [],
+            "net_seen": False,
+        })
+
+        if r["rss_bytes"] is not None:
+            cur_s["rss_values"].append(float(r["rss_bytes"]))
+
+        cpu_tot = None
+        if r["cpu_user_time_s"] is not None or r["cpu_system_time_s"] is not None:
+            cpu_tot = float(r["cpu_user_time_s"] or 0.0) + float(r["cpu_system_time_s"] or 0.0)
+            if cur_s["cpu_prev"] is not None:
+                cur_s["cpu_deltas"].append(max(0.0, cpu_tot - cur_s["cpu_prev"]))
+            cur_s["cpu_prev"] = cpu_tot
+
+        io_tot = None
+        if r["io_read_bytes"] is not None or r["io_write_bytes"] is not None:
+            io_tot = float(r["io_read_bytes"] or 0.0) + float(r["io_write_bytes"] or 0.0)
+            if cur_s["io_prev"] is not None:
+                cur_s["io_deltas"].append(max(0.0, io_tot - cur_s["io_prev"]))
+            cur_s["io_prev"] = io_tot
+
+        if r["net_active"] in (1, True) or (r["net_conn_count"] is not None and int(r["net_conn_count"]) > 0):
+            cur_s["net_seen"] = True
+
+    by_pair: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for s in sessions.values():
+        pk = (s["machine_name"], s["user_name"])
+        item = by_pair.setdefault(pk, {
+            "machine_name": s["machine_name"],
+            "user_name": s["user_name"],
+            "runs": 0,
+            "days": set(),
+            "hours": {},
+            "rss": [],
+            "cpu_delta": [],
+            "io_delta": [],
+            "net_sessions": 0,
+        })
+        item["runs"] += 1
+        item["days"].add(s["day"])
+        if s["hour"] is not None:
+            item["hours"][s["hour"]] = item["hours"].get(s["hour"], 0) + 1
+        if s["rss_values"]:
+            item["rss"].append(max(s["rss_values"]))
+        if s["cpu_deltas"]:
+            item["cpu_delta"].append(max(s["cpu_deltas"]))
+        if s["io_deltas"]:
+            item["io_delta"].append(max(s["io_deltas"]))
+        if s["net_seen"]:
+            item["net_sessions"] += 1
+
+    items = []
+    for item in by_pair.values():
+        if item["hours"]:
+            peak = max(item["hours"].values())
+            hour_thr = max(2, int((peak * 0.5) + 0.9999))
+            typical_hours = sorted([hh for hh, cnt in item["hours"].items() if cnt >= hour_thr and cnt >= 2])
+        else:
+            typical_hours = []
+
+        items.append({
+            "machine_name": item["machine_name"],
+            "user_name": item["user_name"],
+            "runs": item["runs"],
+            "seen_days": len(item["days"]),
+            "typical_hours": ", ".join(f"{h:02d}" for h in typical_hours),
+            "median_rss": _median(item["rss"]),
+            "median_cpu_delta": _median(item["cpu_delta"]),
+            "median_io_delta": _median(item["io_delta"]),
+            "net_sessions": item["net_sessions"],
+        })
+
+    items.sort(key=lambda x: (-int(x["runs"]), str(x["machine_name"]).lower(), str(x["user_name"]).lower()))
+    return {"process_name": pname, "window_days": int(days), "items": items}
+
 
 @app.get("/api/analytics/time-anomalies")
 def analytics_time_anomalies(x_api_key: Optional[str] = Header(default=None), days: int = 14, limit: int = 50):
@@ -1568,33 +2052,6 @@ def analytics_time_anomalies(x_api_key: Optional[str] = Header(default=None), da
 
     cur.execute(
         """
-        SELECT lower(process_name) AS pname, CAST(strftime('%H', start_time) AS INTEGER) AS hh, COUNT(*) AS c
-        FROM events
-        WHERE start_time >= ?
-        GROUP BY pname, hh
-        """,
-        (since,),
-    )
-    hist: Dict[str, Dict[int, int]] = {}
-    total: Dict[str, int] = {}
-    for r in cur.fetchall():
-        pname = r["pname"]
-        hh = int(r["hh"])
-        c = int(r["c"])
-        hist.setdefault(pname, {})[hh] = c
-        total[pname] = total.get(pname, 0) + c
-
-    typical: Dict[str, set] = {}
-    for pname, buckets in hist.items():
-        tot = total.get(pname, 0)
-        if tot < min_samples:
-            continue
-        mx = max(buckets.values()) if buckets else 0
-        thr = max(2, int(mx * 0.3))
-        typical[pname] = {h for h, c in buckets.items() if c >= thr}
-
-    cur.execute(
-        """
         WITH latest AS (
           SELECT machine_name, pid, start_time, MAX(sample_time) AS max_sample
           FROM events
@@ -1606,25 +2063,46 @@ def analytics_time_anomalies(x_api_key: Optional[str] = Header(default=None), da
         JOIN latest l
           ON e.machine_name=l.machine_name AND e.pid IS l.pid AND e.start_time=l.start_time AND e.sample_time=l.max_sample
         ORDER BY e.start_time DESC
-        LIMIT 500
+        LIMIT 1000
         """,
         (since,),
     )
     rows = cur.fetchall()
     conn.close()
 
+    hist: Dict[str, Dict[int, int]] = {}
+    total: Dict[str, int] = {}
+
+    for r in rows:
+        pname = (r["process_name"] or "").lower()
+        hh = _local_hour_from_iso(r["start_time"])
+        if not pname or hh is None:
+            continue
+        hist.setdefault(pname, {})[hh] = hist.setdefault(pname, {}).get(hh, 0) + 1
+        total[pname] = total.get(pname, 0) + 1
+
+    typical: Dict[str, set] = {}
+    for pname, buckets in hist.items():
+        tot = total.get(pname, 0)
+        if tot < min_samples:
+            continue
+        peak = max(buckets.values()) if buckets else 0
+        thr = max(2, int((peak * 0.5) + 0.9999))
+        typical[pname] = {h for h, c in buckets.items() if c >= thr and c >= 2}
+
     out = []
     for r in rows:
         pname = (r["process_name"] or "").lower()
-        st = _safe_parse_iso(r["start_time"])
-        if not st:
+        start_hour_local = _local_hour_from_iso(r["start_time"])
+        if start_hour_local is None:
             continue
-        if pname in typical and typical[pname]:
-            if st.hour not in typical[pname]:
-                d = dict(r)
-                d["time_anomaly"] = True
-                d["pkey"] = _binary_key(d.get("sha256"), d.get("process_name") or "")
-                out.append(d)
+        if pname in typical and typical[pname] and start_hour_local not in typical[pname]:
+            d = dict(r)
+            d["time_anomaly"] = True
+            d["local_start_hour"] = start_hour_local
+            d["typical_hours_local"] = sorted(list(typical[pname]))
+            d["pkey"] = _binary_key(d.get("sha256"), d.get("exe_path"), d.get("process_name") or "")
+            out.append(d)
         if len(out) >= limit:
             break
 
@@ -1632,67 +2110,87 @@ def analytics_time_anomalies(x_api_key: Optional[str] = Header(default=None), da
 
 
 @app.get("/api/analytics/chains")
-def analytics_chains(x_api_key: Optional[str] = Header(default=None), days: int = 7, machine_name: str = "", limit: int = 50):
+def analytics_chains(
+    x_api_key: Optional[str] = Header(default=None),
+    days: int = 7,
+    machine_name: str = "",
+    process_name: str = "",
+    limit: int = 50,
+):
     require_api_key(x_api_key)
     days = int(days)
     limit = int(limit)
     since, _ = _window_bounds(days)
     machine = machine_name.strip()
+    proc = process_name.strip().lower()
 
     conn = db_connect()
     cur = conn.cursor()
 
-    q = """
-    WITH latest AS (
-      SELECT machine_name, pid, start_time, MAX(sample_time) AS max_sample
-      FROM events
-      WHERE sample_time >= ?
-      {machine_filter}
-      GROUP BY machine_name, pid, start_time
-    )
-    SELECT e.machine_name, e.process_name, e.pid, e.ppid, e.start_time, e.end_time, e.duration_seconds
-    FROM events e
-    JOIN latest l
-      ON e.machine_name=l.machine_name AND e.pid IS l.pid AND e.start_time=l.start_time AND e.sample_time=l.max_sample
-    ORDER BY e.machine_name, e.start_time
-    """
-    mf = ""
+    wh = ["sample_time >= ?"]
     params: List[Any] = [since]
     if machine:
-        mf = "AND machine_name=?"
+        wh.append("machine_name = ?")
         params.append(machine)
+    if proc:
+        wh.append("lower(process_name) = ?")
+        params.append(proc)
 
-    cur.execute(q.format(machine_filter=mf), params)
+    cur.execute(
+        f"""
+        SELECT machine_name, process_name, pid, ppid, start_time, end_time, duration_seconds, sample_time
+        FROM events
+        WHERE {" AND ".join(wh)}
+        ORDER BY machine_name, start_time, sample_time
+        """,
+        params,
+    )
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
 
-    nodes: Dict[Tuple[str, int, str], Dict[str, Any]] = {}
+    latest_by_session: Dict[Tuple[str, int, str], Dict[str, Any]] = {}
     for r in rows:
-        m = r["machine_name"]
-        pid = r.get("pid")
-        st = r.get("start_time")
-        if pid is None or st is None:
-            continue
-        nodes[(m, int(pid), st)] = r
+        key = (r["machine_name"], int(r["pid"] or 0), r["start_time"])
+        prev = latest_by_session.get(key)
+        if not prev or str(r["sample_time"]) > str(prev["sample_time"]):
+            latest_by_session[key] = r
 
+    nodes = latest_by_session
     children_map: Dict[Tuple[str, int, str], List[Tuple[str, int, str]]] = {}
-    for (m, pid, st), r in nodes.items():
-        ppid = r.get("ppid")
+
+    node_items = list(nodes.items())
+    for child_key, child in node_items:
+        ppid = child.get("ppid")
         if ppid is None:
             continue
-        for (m2, ppid2, st2) in list(nodes.keys()):
-            if m2 == m and ppid2 == int(ppid):
-                children_map.setdefault((m2, ppid2, st2), []).append((m, pid, st))
-                break
+
+        child_start = _safe_parse_iso(child.get("start_time"))
+        best_parent = None
+        best_parent_dt = None
+
+        for parent_key, parent in node_items:
+            if parent_key[0] != child_key[0]:
+                continue
+            if int(parent.get("pid") or 0) != int(ppid):
+                continue
+
+            parent_start = _safe_parse_iso(parent.get("start_time"))
+            parent_end = _safe_parse_iso(parent.get("end_time")) if parent.get("end_time") else None
+            if child_start and parent_start and parent_start > child_start:
+                continue
+            if child_start and parent_end and parent_end < child_start:
+                continue
+
+            if best_parent is None or (parent_start and best_parent_dt and parent_start > best_parent_dt):
+                best_parent = parent_key
+                best_parent_dt = parent_start
+
+        if best_parent:
+            children_map.setdefault(best_parent, []).append(child_key)
 
     def render_tree(root_key: Tuple[str, int, str], depth: int = 0) -> List[str]:
         r = nodes[root_key]
-        name = r.get("process_name") or "unknown"
-        pid = r.get("pid")
-        st = r.get("start_time") or ""
-        dur = r.get("duration_seconds") or 0
-        end = r.get("end_time")
-        line = f"{'  '*depth}{'└─' if depth else ''}{name} (pid={pid}, start={st}, dur={dur}s{' end='+end if end else ''})"
+        line = f"{'  '*depth}{'' if depth == 0 else '-> '}{r.get('process_name') or 'unknown'} (pid={r.get('pid')}, start={r.get('start_time')})"
         lines = [line]
         for ck in children_map.get(root_key, []):
             lines.extend(render_tree(ck, depth + 1))
@@ -1701,11 +2199,15 @@ def analytics_chains(x_api_key: Optional[str] = Header(default=None), days: int 
     all_children = {ck for lst in children_map.values() for ck in lst}
     roots = [k for k in nodes.keys() if k not in all_children]
 
-    trees = []
+    items = []
     for rk in roots[:limit]:
-        trees.append({"machine_name": rk[0], "text": "\n".join(render_tree(rk))})
+        items.append({
+            "machine_name": rk[0],
+            "root_process": nodes[rk].get("process_name"),
+            "text": "\n".join(render_tree(rk)),
+        })
 
-    return {"window_days": days, "items": trees}
+    return {"window_days": days, "items": items}
 
 
 # Alerts API (MVP)
@@ -1719,6 +2221,7 @@ def get_alerts(
     machine: str = "",
     user: str = "",
     metric: str = "",
+    entity_type: str = "",
     limit: int = 200,
     offset: int = 0,
 ):
@@ -1745,6 +2248,9 @@ def get_alerts(
     if metric.strip():
         wh.append("metric = ?")
         params.append(metric.strip())
+    if entity_type.strip():
+        wh.append("entity_type = ?")
+        params.append(entity_type.strip())
 
     where_sql = ("WHERE " + " AND ".join(wh)) if wh else ""
 
@@ -1759,7 +2265,16 @@ def get_alerts(
 
     cur.execute(
         f"""
-        SELECT *
+        SELECT
+            id, created_at, sample_time,
+            machine_name, user_name,
+            entity_type,
+            process_name, pid, start_time,
+            sha256, exe_path,
+            parent_process_name, parent_sha256, parent_exe_path, chain_key,
+            metric, value, baseline, score, severity, reason,
+            status, ack_by, ack_at, closed_at,
+            bucket_hour, dedup_key
         FROM alerts
         {where_sql}
         ORDER BY created_at DESC, id DESC
@@ -1848,6 +2363,6 @@ def download_client_agent(x_client_key: Optional[str] = Header(default=None)):
 
 if __name__ == "__main__":
     import uvicorn
-    host = str(_cfg_get("host", "0.0.0.0"))
-    port = int(_cfg_get("port", 8000))
+    host = str(_cfg_get("host", _cfg_get("listen_host", "0.0.0.0")))
+    port = int(_cfg_get("port", _cfg_get("listen_port", 8000)))
     uvicorn.run(app, host=host, port=port)

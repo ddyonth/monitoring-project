@@ -24,18 +24,24 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "batch_size": 300,
 }
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "client_config.json")
+CONFIG_CANDIDATES = [
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "client_config.json"),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"),
+]
 
 def load_config() -> Dict[str, Any]:
     cfg = DEFAULT_CONFIG.copy()
-    try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            disk = json.load(f)
-        if isinstance(disk, dict):
-            cfg.update(disk)
-    except Exception:
-        pass
+    for path in CONFIG_CANDIDATES:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                disk = json.load(f)
+            if isinstance(disk, dict):
+                cfg.update(disk)
+                break
+        except Exception:
+            pass
     return cfg
+
 
 
 # DB
