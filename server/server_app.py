@@ -2338,6 +2338,57 @@ def close_alert(
     conn.close()
     return {"ok": True, "updated": int(changed)}
 
+@app.post("/api/alerts/{alert_id}/status")
+def set_alert_status(
+    alert_id: int,
+    payload: Dict[str, Any] = Body(...),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    require_api_key(x_api_key)
+
+    status = str(payload.get("status") or "").strip().lower()
+    if status not in {"new", "ack", "closed"}:
+        raise HTTPException(status_code=400, detail="status must be one of: new, ack, closed")
+
+    by = str(payload.get("by") or payload.get("ack_by") or payload.get("closed_by") or "").strip() or "user"
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    conn = db_connect()
+    cur = conn.cursor()
+
+    if status == "new":
+        cur.execute(
+            """
+            UPDATE alerts
+            SET status='new', ack_by=NULL, ack_at=NULL, closed_at=NULL
+            WHERE id=?
+            """,
+            (int(alert_id),),
+        )
+    elif status == "ack":
+        cur.execute(
+            """
+            UPDATE alerts
+            SET status='ack', ack_by=?, ack_at=?, closed_at=NULL
+            WHERE id=?
+            """,
+            (by, now, int(alert_id)),
+        )
+    else:
+        cur.execute(
+            """
+            UPDATE alerts
+            SET status='closed', ack_by=COALESCE(ack_by, ?), ack_at=COALESCE(ack_at, ?), closed_at=?
+            WHERE id=?
+            """,
+            (by, now, now, int(alert_id)),
+        )
+
+    conn.commit()
+    changed = cur.rowcount
+    conn.close()
+    return {"ok": True, "updated": int(changed), "status": status}
+
 
 # Client release
 

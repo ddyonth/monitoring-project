@@ -1251,7 +1251,11 @@ function getProcType(name) {
                   <td class="mono">${escapeHtml((a.baseline ?? "—").toString())}</td>
                   <td class="mono">${escapeHtml(fmtScore(a.score))}</td>
                   <td class="mono" style="max-width:520px; white-space:pre-wrap;">${escapeHtml(a.reason || "")}</td>
-                  <td>${escapeHtml(a.status || "")}</td>
+                  <td data-alert-status-cell="1" data-alert-id="${escapeHtml(String(a.id || ""))}">
+                    <span data-alert-status-text="1">${escapeHtml(a.status || "")}</span>
+                    <button data-alert-edit="1" data-alert-id="${escapeHtml(String(a.id || ""))}" style="margin-left:6px; padding:2px 8px; border-radius:999px; border:1px solid #ddd; cursor:pointer;">✏️</button>
+                  </td>
+
                 </tr>
               `).join("") || `<tr><td colspan="12" class="muted">Нет данных</td></tr>`
             }
@@ -1259,6 +1263,56 @@ function getProcType(name) {
         </table></div>
       </div>
     `;
+  }
+
+    async function wireAlertsEditor() {
+    const root = byId("anAlertsOut");
+    if (!root) return;
+
+    root.onclick = async (ev) => {
+      const editBtn = ev.target && ev.target.closest ? ev.target.closest('button[data-alert-edit="1"]') : null;
+      if (!editBtn) return;
+
+      const alertId = editBtn.getAttribute("data-alert-id") || "";
+      const cell = editBtn.closest('td[data-alert-status-cell="1"]');
+      if (!alertId || !cell) return;
+
+      const textEl = cell.querySelector('[data-alert-status-text="1"]');
+      const current = textEl ? (textEl.textContent || "").trim().toLowerCase() : "new";
+
+      cell.innerHTML = `
+        <select data-alert-status-select="1" style="padding:2px 8px; border-radius:999px; border:1px solid #ddd; font-size:12px;">
+          <option value="new">Новый</option>
+          <option value="ack">В работе</option>
+          <option value="closed">Закрыт</option>
+        </select>
+        <button data-alert-save="1" data-alert-id="${escapeHtml(alertId)}" style="margin-left:6px; padding:2px 8px; border-radius:999px; border:1px solid #ddd; cursor:pointer;">Сохранить</button>
+        <button data-alert-cancel="1" style="margin-left:6px; padding:2px 8px; border-radius:999px; border:1px solid #ddd; cursor:pointer;">Отмена</button>
+      `;
+
+      const sel = cell.querySelector('select[data-alert-status-select="1"]');
+      if (sel) sel.value = current || "new";
+    };
+
+    root.addEventListener("click", async (ev) => {
+      const saveBtn = ev.target && ev.target.closest ? ev.target.closest('button[data-alert-save="1"]') : null;
+      if (saveBtn) {
+        const alertId = saveBtn.getAttribute("data-alert-id") || "";
+        const cell = saveBtn.closest('td[data-alert-status-cell="1"]') || saveBtn.parentElement;
+        const sel = cell ? cell.querySelector('select[data-alert-status-select="1"]') : null;
+        const status = sel ? sel.value : "";
+        if (!alertId || !status) return;
+
+        await apiPostJson(`/api/alerts/${encodeURIComponent(alertId)}/status`, { status });
+        await refreshAnalytics();
+        return;
+      }
+
+      const cancelBtn = ev.target && ev.target.closest ? ev.target.closest('button[data-alert-cancel="1"]') : null;
+      if (cancelBtn) {
+        await refreshAnalytics();
+      }
+    });
   }
 
   async function loadMachineProfile() {
@@ -1377,6 +1431,7 @@ function getProcType(name) {
   await loadHosts();
   await loadProcesses();
   await refreshAnalytics();
+  await wireAlertsEditor();
 }
 
   // Settings tab
