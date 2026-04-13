@@ -1304,12 +1304,47 @@ function getProcType(name) {
     `;
   }
 
+  async function loadChainsProfile() {
+    const host = hostSel.value || "";
+    const days = Number(byId("anDays")?.value || 14) || 14;
+    const pname = procSel.value || "";
+
+    const q = new URLSearchParams();
+    q.set("days", String(days));
+    q.set("limit", "100");
+    if (host) q.set("machine_name", host);
+    if (pname) q.set("process_name", pname);
+
+    const data = await apiGetJson(`/api/analytics/chains?${q.toString()}`);
+    const items = data.items || [];
+
+    return `
+      <div class="card">
+        <h3 style="margin-top:0;">Цепочки процессов</h3>
+        <div class="tableWrap"><table>
+          <thead><tr><th>Машина</th><th>Корневой процесс</th><th>Цепочка</th></tr></thead>
+          <tbody>
+            ${items.map(x => `<tr>
+              <td>${escapeHtml(x.machine_name || "")}</td>
+              <td>${escapeHtml(x.root_process || "")}</td>
+              <td class="mono" style="white-space:pre-wrap;">${escapeHtml(x.text || "")}</td>
+            </tr>`).join("") || `<tr><td colspan="3" class="muted">Нет данных</td></tr>`}
+          </tbody>
+        </table></div>
+      </div>
+    `;
+  }
+
+
   async function refreshAnalytics() {
     try {
       const alertsHtml = await loadAlerts();
       let profileHtml = "";
+
       if (profileTypeSel.value === "machine") profileHtml = await loadMachineProfile();
       if (profileTypeSel.value === "process") profileHtml = await loadProcessProfile();
+      if (profileTypeSel.value === "chains") profileHtml = await loadChainsProfile();
+
       out.innerHTML = alertsHtml + profileHtml;
     } catch (e) {
       out.innerHTML = `<div class="error">Ошибка аналитики: ${escapeHtml(e.message || String(e))}</div>`;
