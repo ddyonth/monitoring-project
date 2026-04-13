@@ -1207,6 +1207,16 @@ function getProcType(name) {
     ).join("");
   }
 
+async function loadChainsList() {
+  const days = Number(byId("anDays")?.value || 14) || 14;
+  const data = await apiGetJson(`/api/analytics/chain-keys?days=${encodeURIComponent(days)}&limit=200`);
+  const items = data.items || [];
+  chainSel.innerHTML = `<option value="">(выберите цепочку)</option>` + items.map(x => {
+    const label = `${x.parent_process_name || "unknown"} -> ${x.child_process_name || "unknown"}`;
+    return `<option value="${escapeHtml(x.chain_key || "")}">${escapeHtml(label)}</option>`;
+  }).join("");
+}
+
   async function loadAlerts() {
     const q = new URLSearchParams();
     q.set("since", isoSinceFromPeriod(byId("alPeriod")?.value || "7d"));
@@ -1373,23 +1383,25 @@ function getProcType(name) {
     `;
   }
 
-  async function loadChainsProfile() {
+   async function loadChainProfile() {
     const host = hostSel.value || "";
     const days = Number(byId("anDays")?.value || 14) || 14;
-    const pname = procSel.value || "";
+    const selectedChain = chainSel.value || "";
+
+    if (!selectedChain) return `<div class="card"><div class="muted">Выберите цепочку.</div></div>`;
 
     const q = new URLSearchParams();
     q.set("days", String(days));
     q.set("limit", "100");
+    q.set("chain_key", selectedChain);
     if (host) q.set("machine_name", host);
-    if (pname) q.set("process_name", pname);
 
     const data = await apiGetJson(`/api/analytics/chains?${q.toString()}`);
     const items = data.items || [];
 
     return `
       <div class="card">
-        <h3 style="margin-top:0;">Цепочки процессов</h3>
+        <h3 style="margin-top:0;">Профиль цепочки</h3>
         <div class="tableWrap"><table>
           <thead><tr><th>Машина</th><th>Корневой процесс</th><th>Цепочка</th></tr></thead>
           <tbody>
@@ -1427,11 +1439,16 @@ function getProcType(name) {
   profileTypeSel.addEventListener("change", refreshAnalytics);
   hostSel.addEventListener("change", refreshAnalytics);
   procSel.addEventListener("change", refreshAnalytics);
+  chainSel.addEventListener("change", refreshAnalytics);
+  byId("anDays").addEventListener("change", async () => {
+    await loadChainsList();
+    await refreshAnalytics();
+  });
 
   await loadHosts();
   await loadProcesses();
+  await loadChainsList();
   await refreshAnalytics();
-  await wireAlertsEditor();
 }
 
   // Settings tab

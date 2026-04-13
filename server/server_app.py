@@ -2108,6 +2108,42 @@ def analytics_time_anomalies(x_api_key: Optional[str] = Header(default=None), da
 
     return {"window_days": days, "items": out}
 
+@app.get("/api/analytics/chain-keys")
+def analytics_chain_keys(
+    x_api_key: Optional[str] = Header(default=None),
+    days: int = 14,
+    limit: int = 200,
+):
+    require_api_key(x_api_key)
+    since, _ = _window_bounds(int(days))
+
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT
+            COALESCE(NULLIF(p.sha256, ''), 'path:' || lower(COALESCE(p.exe_path, '')), 'name:' || lower(p.process_name)) ||
+            ' -> ' ||
+            COALESCE(NULLIF(c.sha256, ''), 'path:' || lower(COALESCE(c.exe_path, '')), 'name:' || lower(c.process_name)) AS chain_key,
+            MIN(p.process_name) AS parent_process_name,
+            MIN(c.process_name) AS child_process_name,
+            COUNT(*) AS rows_count
+        FROM events c
+        JOIN events p
+          ON p.machine_name = c.machine_name
+         AND p.pid = c.ppid
+         AND p.start_time <= c.start_time
+         AND (p.end_time IS NULL OR p.end_time = '' OR p.end_time >= c.start_time)
+        WHERE c.sample_time >= ?
+        GROUP BY chain_key
+        ORDER BY rows_count DESC, chain_key ASC
+        LIMIT ?
+        """,
+        (since, max(1, min(int(limit), 500))),
+    )
+    items = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return {"items": items}
 
 @app.get("/api/analytics/chains")
 def analytics_chains(
@@ -2115,14 +2151,17 @@ def analytics_chains(
     days: int = 7,
     machine_name: str = "",
     process_name: str = "",
+    chain_key: str = "",
     limit: int = 50,
 ):
+
     require_api_key(x_api_key)
     days = int(days)
     limit = int(limit)
     since, _ = _window_bounds(days)
     machine = machine_name.strip()
     proc = process_name.strip().lower()
+    chain_filter = chain_key.strip()
 
     conn = db_connect()
     cur = conn.cursor()
@@ -2206,6 +2245,13 @@ def analytics_chains(
             "root_process": nodes[rk].get("process_name"),
             "text": "\n".join(render_tree(rk)),
         })
+
+    if chain_filter:
+        filtered = []
+        for item in items:
+            if chain_filter in (item.get("text") or ""):
+                filtered.append(item)
+        items = filtered
 
     return {"window_days": days, "items": items}
 
