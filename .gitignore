@@ -1,0 +1,41 @@
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual env
+venv/
+.venv/
+env/
+
+# PyCharm
+.idea/
+
+
+# Build / PyInstaller
+build/
+dist/
+*.spec.cache
+
+# PyInstaller temp
+*.toc
+*.pyz
+*.pkg
+*.exe
+*.zip
+
+# Logs / temp
+*.log
+*.lock
+
+# Databases
+*.db
+*.sqlite3
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config (если появятся секреты)
+.env
