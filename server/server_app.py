@@ -1351,6 +1351,36 @@ def _count_prior_binary_sessions(
     row = cur.fetchone()
     return int((row["c"] if row else 0) or 0)
 
+def _process_in_catalog(cur: sqlite3.Cursor, process_name: str) -> bool:
+    cur.execute(
+        "SELECT 1 FROM process_catalog WHERE lower(process_name)=lower(?) LIMIT 1;",
+        (process_name.strip(),),
+    )
+    return cur.fetchone() is not None
+
+
+def _count_process_sessions_on_machine(
+    cur: sqlite3.Cursor,
+    machine: str,
+    pid: int,
+    start_time: str,
+    sample_time: str,
+    process_name: str,
+) -> int:
+    cur.execute(
+        """
+        SELECT COUNT(DISTINCT machine_name || '|' || COALESCE(pid, '') || '|' || start_time) AS c
+        FROM events
+        WHERE machine_name=?
+          AND sample_time < ?
+          AND lower(process_name)=lower(?)
+          AND NOT (machine_name=? AND COALESCE(pid, 0)=? AND start_time=?)
+        """,
+        (machine, sample_time, process_name, machine, int(pid), start_time),
+    )
+    row = cur.fetchone()
+    return int((row["c"] if row else 0) or 0)
+
 def _count_prior_chain_sessions(
     cur: sqlite3.Cursor,
     machine: str,
@@ -1621,15 +1651,18 @@ def detect_alerts_for_ingested_events(events_payload: List[Dict[str, Any]]) -> i
                 "bucket_hour": bucket_hour,
             })
 
-        prior_binary_sessions = _count_prior_binary_sessions(
-            cur, machine, user_name, pid, start_time, until_iso, sha256, exe_path, process_name
+        process_known = _process_in_catalog(cur, process_name)
+        prior_process_sessions = _count_process_sessions_on_machine(
+            cur, machine, pid, start_time, until_iso, process_name
         )
-        if prior_binary_sessions <= rare_thr:
-            if prior_binary_sessions == 0:
-                reason = "Процесс ранее не наблюдался на данной машине."
+        total_process_sessions = prior_process_sessions + 1
+
+        if (not process_known) and total_process_sessions <= rare_thr:
+            if total_process_sessions == 1:
+                reason = "Процесс ранее не наблюдался на данной машине (отсутствует в справочнике)."
                 sev = "med"
             else:
-                reason = f"Процесс наблюдался {prior_binary_sessions} раз(а), что ниже порога {rare_thr}."
+                reason = f"Процесс отсутствует в справочнике; число наблюдений на данной машине: {total_process_sessions}, что ниже порога {rare_thr}."
                 sev = "low"
 
             session_alerts.append({
@@ -1648,7 +1681,7 @@ def detect_alerts_for_ingested_events(events_payload: List[Dict[str, Any]]) -> i
                 "parent_exe_path": None,
                 "chain_key": None,
                 "metric": "rarity",
-                "value": float(prior_binary_sessions),
+                "value": float(total_process_sessions),
                 "baseline": float(rare_thr),
                 "score": None,
                 "severity": sev,
