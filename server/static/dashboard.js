@@ -1084,6 +1084,7 @@ function getProcType(name) {
       <h3 style="margin-top:0;">Оповещения</h3>
       <div class="badge" style="display:flex; flex-wrap:wrap; gap:10px; align-items:center;">
         <select id="alPeriod">
+          <option value="1h">1ч</option>
           <option value="24h">24ч</option>
           <option value="7d" selected>7д</option>
           <option value="30d">30д</option>
@@ -1166,6 +1167,7 @@ function getProcType(name) {
   function isoSinceFromPeriod(p) {
     const now = Date.now();
     let ms = 7 * 24 * 3600 * 1000;
+    if (p === "1h") ms = 3600 * 1000;
     if (p === "24h") ms = 24 * 3600 * 1000;
     if (p === "30d") ms = 30 * 24 * 3600 * 1000;
     return new Date(now - ms).toISOString();
@@ -1268,7 +1270,7 @@ function getProcType(name) {
               items.map(a => `
                 <tr>
                   <td class="mono">${escapeHtml(fmtLocalTs(a.sample_time || ""))}</td>
-                  <td><span class="pill ${(a.severity==='high')?'warn':''}">${escapeHtml(a.severity || "")}</span></td>
+                  <td><span class="pill ${(a.severity==='high') ? 'warn' : ((a.severity==='med') ? 'medwarn' : '')}">${escapeHtml(a.severity || "")}</span></td>
                   <td>${escapeHtml(a.entity_type || "")}</td>
                   <td>${escapeHtml(alertRuleGroup(a))}</td>
                   <td>${escapeHtml(alertEntityName(a))}</td>
