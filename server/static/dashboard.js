@@ -1103,6 +1103,10 @@ function getProcType(name) {
           <option value="high">Высокий</option>
         </select>
 
+        <select id="alMachine">
+          <option value="">Машина: все</option>
+        </select>
+
         <select id="alEntityType">
           <option value="">Сущность: все</option>
           <option value="process_session">сессия процесса</option>
@@ -1153,6 +1157,7 @@ function getProcType(name) {
 
   const alertsOut = byId("anAlertsOut");
   const profilesOut = byId("anProfilesOut");
+  const alertMachineSel = byId("alMachine");
   const hostSel = byId("anHostSel");
   const procSel = byId("anProcessSel");
   const chainSel = byId("anChainSel");
@@ -1192,11 +1197,21 @@ function getProcType(name) {
   async function loadHosts() {
     const m = await apiGetJson("/api/machines");
     const items = (m && m.items) ? m.items : [];
-    hostSel.innerHTML = `<option value="">(все)</option>` + items.map(x => {
+
+    const optionsHtml = `<option value="">(все)</option>` + items.map(x => {
       const name = x.machine_name || "";
       const alias = x.alias ? ` (${x.alias})` : "";
       return `<option value="${escapeHtml(name)}">${escapeHtml(name + alias)}</option>`;
     }).join("");
+
+    hostSel.innerHTML = optionsHtml;
+    if (alertMachineSel) {
+      alertMachineSel.innerHTML = `<option value="">Машина: все</option>` + items.map(x => {
+        const name = x.machine_name || "";
+        const alias = x.alias ? ` (${x.alias})` : "";
+        return `<option value="${escapeHtml(name)}">${escapeHtml(name + alias)}</option>`;
+      }).join("");
+    }
   }
 
   async function loadProcesses() {
@@ -1224,6 +1239,7 @@ function getProcType(name) {
     if (byId("alStatus")?.value) q.set("status", byId("alStatus").value);
     if (byId("alSeverity")?.value) q.set("severity", byId("alSeverity").value);
     if (byId("alEntityType")?.value) q.set("entity_type", byId("alEntityType").value);
+    if (byId("alMachine")?.value) q.set("machine", byId("alMachine").value);
     q.set("limit", "200");
     q.set("offset", "0");
 
