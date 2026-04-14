@@ -213,6 +213,25 @@ def ensure_schema() -> None:
         """
     )
 
+    # --- chain catalog
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS chain_catalog (
+            chain_key TEXT PRIMARY KEY,
+            chain_name TEXT NOT NULL,
+            chain_type TEXT,
+            description TEXT,
+            updated_at TEXT
+        );
+        """
+    )
+
+    cur.execute("PRAGMA table_info(chain_catalog);")
+    cc_cols = {row[1] for row in cur.fetchall()}
+    if "updated_at" not in cc_cols:
+        cur.execute("ALTER TABLE chain_catalog ADD COLUMN updated_at TEXT;")
+
+
     # --- roles (minimal)
     cur.execute(
         """
@@ -724,6 +743,58 @@ def get_process_catalog(x_api_key: Optional[str] = Header(default=None)):
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
     return {"items": rows}
+
+@app.get("/api/chain-catalog")
+def get_chain_catalog(x_api_key: Optional[str] = Header(default=None)):
+    require_api_key(x_api_key)
+
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT chain_key, chain_name, chain_type, description, updated_at
+        FROM chain_catalog
+        ORDER BY chain_name COLLATE NOCASE, chain_key COLLATE NOCASE
+        """
+    )
+    items = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return {"items": items}
+
+
+@app.post("/api/chain-catalog-item")
+def upsert_chain_catalog_item(payload: Dict[str, Any] = Body(...), x_api_key: Optional[str] = Header(default=None)):
+    require_api_key(x_api_key)
+
+    chain_key = str(payload.get("chain_key") or "").strip()
+    chain_name = str(payload.get("chain_name") or "").strip()
+    chain_type = str(payload.get("chain_type") or "").strip()
+    description = str(payload.get("description") or "").strip()
+
+    if not chain_key:
+        raise HTTPException(status_code=400, detail="chain_key required")
+    if not chain_name:
+        raise HTTPException(status_code=400, detail="chain_name required")
+
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO chain_catalog(chain_key, chain_name, chain_type, description, updated_at)
+        VALUES(?, ?, ?, ?, ?)
+        ON CONFLICT(chain_key) DO UPDATE SET
+            chain_name=excluded.chain_name,
+            chain_type=excluded.chain_type,
+            description=excluded.description,
+            updated_at=excluded.updated_at
+        """,
+        (chain_key, chain_name, chain_type or None, description or None, now),
+    )
+    conn.commit()
+    conn.close()
+    return {"ok": True}
 
 @app.post("/api/process-catalog-item")
 def upsert_process_catalog_item(payload: Dict[str, Any] = Body(...), x_api_key: Optional[str] = Header(default=None)):
@@ -1341,6 +1412,10 @@ def _count_prior_chain_sessions(
     row = cur.fetchone()
     return int((row["c"] if row else 0) or 0)
 
+def _chain_in_catalog(cur: sqlite3.Cursor, chain_key: str) -> bool:
+    cur.execute("SELECT 1 FROM chain_catalog WHERE chain_key=? LIMIT 1;", (chain_key,))
+    return cur.fetchone() is not None
+
 
 def _typical_hours_for_process(
     cur: sqlite3.Cursor,
@@ -1584,41 +1659,47 @@ def detect_alerts_for_ingested_events(events_payload: List[Dict[str, Any]]) -> i
 
         parent_ctx = _load_parent_context(cur, latest)
         if parent_ctx:
-            prior_chain_sessions = _count_prior_chain_sessions(
-                cur, machine, user_name, pid, start_time, until_iso, parent_ctx["parent_key"], parent_ctx["child_key"]
-            )
-            if prior_chain_sessions <= rare_thr:
-                if prior_chain_sessions == 0:
-                    reason = "Цепочка parent -> child ранее не наблюдалась."
-                    sev = "med"
-                else:
-                    reason = f"Цепочка встречалась {prior_chain_sessions} раз(а), что ниже порога {rare_thr}."
-                    sev = "low"
+            chain_key = str(parent_ctx["chain_key"] or "")
+            chain_known = _chain_in_catalog(cur, chain_key)
+            # if known chain from catalog -> do not create chain_rarity alert
+            if not chain_known:
+                prior_chain_sessions = _count_prior_chain_sessions(
+                    cur, machine, user_name, pid, start_time, until_iso, parent_ctx["parent_key"],
+                    parent_ctx["child_key"]
+                )
 
-                session_alerts.append({
-                    "created_at": now_iso,
-                    "sample_time": until_iso,
-                    "machine_name": machine,
-                    "user_name": user_name,
-                    "entity_type": "process_chain",
-                    "process_name": process_name,
-                    "pid": int(latest["pid"] or 0) if latest["pid"] is not None else None,
-                    "start_time": str(latest["start_time"]) if latest["start_time"] is not None else None,
-                    "sha256": sha256 or None,
-                    "exe_path": exe_path or None,
-                    "parent_process_name": parent_ctx["parent_process_name"],
-                    "parent_sha256": parent_ctx["parent_sha256"],
-                    "parent_exe_path": parent_ctx["parent_exe_path"],
-                    "chain_key": parent_ctx["chain_key"],
-                    "metric": "chain_rarity",
-                    "value": float(prior_chain_sessions),
-                    "baseline": float(rare_thr),
-                    "score": None,
-                    "severity": sev,
-                    "reason": reason,
-                    "status": "new",
-                    "bucket_hour": bucket_hour,
-                })
+                if prior_chain_sessions <= rare_thr:
+                    if prior_chain_sessions == 0:
+                        reason = "Цепочка не описана в справочнике и ранее не наблюдалась на данной машине."
+                        sev = "med"
+                    else:
+                        reason = f"Цепочка не описана в справочнике; ранее наблюдалась ограниченно ({prior_chain_sessions} раз(а)) на данной машине."
+                        sev = "low"
+
+                    session_alerts.append({
+                        "created_at": now_iso,
+                        "sample_time": until_iso,
+                        "machine_name": machine,
+                        "user_name": user_name,
+                        "entity_type": "process_chain",
+                        "process_name": process_name,
+                        "pid": int(latest["pid"] or 0) if latest["pid"] is not None else None,
+                        "start_time": str(latest["start_time"]) if latest["start_time"] is not None else None,
+                        "sha256": sha256 or None,
+                        "exe_path": exe_path or None,
+                        "parent_process_name": parent_ctx["parent_process_name"],
+                        "parent_sha256": parent_ctx["parent_sha256"],
+                        "parent_exe_path": parent_ctx["parent_exe_path"],
+                        "chain_key": chain_key,
+                        "metric": "chain_rarity",
+                        "value": float(prior_chain_sessions),
+                        "baseline": float(rare_thr),
+                        "score": None,
+                        "severity": sev,
+                        "reason": reason,
+                        "status": "new",
+                        "bucket_hour": bucket_hour,
+                    })
 
         typical_hours, hist_size = _typical_hours_for_process(
             cur, machine, user_name, pid, start_time, until_iso, sha256, exe_path, process_name
@@ -2177,7 +2258,7 @@ def analytics_chains(
 
     cur.execute(
         f"""
-        SELECT machine_name, process_name, pid, ppid, start_time, end_time, duration_seconds, sample_time
+        SELECT machine_name, process_name, pid, ppid, start_time, end_time, duration_seconds, sample_time, sha256, exe_path
         FROM events
         WHERE {" AND ".join(wh)}
         ORDER BY machine_name, start_time, sample_time
@@ -2227,31 +2308,42 @@ def analytics_chains(
         if best_parent:
             children_map.setdefault(best_parent, []).append(child_key)
 
-    def render_tree(root_key: Tuple[str, int, str], depth: int = 0) -> List[str]:
+    def _node_bin_key(node: Dict[str, Any]) -> str:
+        return _binary_key(node.get("sha256"), node.get("exe_path"), node.get("process_name") or "")
+
+    def render_tree(root_key: Tuple[str, int, str], depth: int = 0) -> Tuple[List[str], List[str]]:
         r = nodes[root_key]
-        line = f"{'  '*depth}{'' if depth == 0 else '-> '}{r.get('process_name') or 'unknown'} (pid={r.get('pid')}, start={r.get('start_time')})"
+        line = f"{'  ' * depth}{'' if depth == 0 else '-> '}{r.get('process_name') or 'unknown'} (pid={r.get('pid')}, start={r.get('start_time')})"
         lines = [line]
+        edge_keys: List[str] = []
+
         for ck in children_map.get(root_key, []):
-            lines.extend(render_tree(ck, depth + 1))
-        return lines
+            parent_node = nodes[root_key]
+            child_node = nodes[ck]
+            edge_key = f"{_node_bin_key(parent_node)} -> {_node_bin_key(child_node)}"
+            edge_keys.append(edge_key)
+
+            child_lines, child_edge_keys = render_tree(ck, depth + 1)
+            lines.extend(child_lines)
+            edge_keys.extend(child_edge_keys)
+
+        return lines, edge_keys
 
     all_children = {ck for lst in children_map.values() for ck in lst}
     roots = [k for k in nodes.keys() if k not in all_children]
 
     items = []
     for rk in roots[:limit]:
+        lines, edge_keys = render_tree(rk)
         items.append({
             "machine_name": rk[0],
             "root_process": nodes[rk].get("process_name"),
-            "text": "\n".join(render_tree(rk)),
+            "chain_keys": edge_keys,
+            "text": "\n".join(lines),
         })
 
     if chain_filter:
-        filtered = []
-        for item in items:
-            if chain_filter in (item.get("text") or ""):
-                filtered.append(item)
-        items = filtered
+        items = [item for item in items if chain_filter in (item.get("chain_keys") or [])]
 
     return {"window_days": days, "items": items}
 

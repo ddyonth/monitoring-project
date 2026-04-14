@@ -1207,15 +1207,16 @@ function getProcType(name) {
     ).join("");
   }
 
-async function loadChainsList() {
-  const days = Number(byId("anDays")?.value || 14) || 14;
-  const data = await apiGetJson(`/api/analytics/chain-keys?days=${encodeURIComponent(days)}&limit=200`);
-  const items = data.items || [];
-  chainSel.innerHTML = `<option value="">(выберите цепочку)</option>` + items.map(x => {
-    const label = `${x.parent_process_name || "unknown"} -> ${x.child_process_name || "unknown"}`;
-    return `<option value="${escapeHtml(x.chain_key || "")}">${escapeHtml(label)}</option>`;
-  }).join("");
-}
+  async function loadChainsList() {
+    const days = Number(byId("anDays")?.value || 14) || 14;
+    const data = await apiGetJson(`/api/analytics/chain-keys?days=${encodeURIComponent(days)}&limit=200`);
+    const items = data.items || [];
+
+    chainSel.innerHTML = `<option value="">(выберите цепочку)</option>` + items.map(x => {
+      const label = `${x.parent_process_name || "unknown"} -> ${x.child_process_name || "unknown"}`;
+      return `<option value="${escapeHtml(x.chain_key || "")}">${escapeHtml(label)}</option>`;
+    }).join("");
+  }
 
   async function loadAlerts() {
     const q = new URLSearchParams();
@@ -1275,36 +1276,37 @@ async function loadChainsList() {
     `;
   }
 
-    async function wireAlertsEditor() {
+    function wireAlertsEditor() {
     const root = byId("anAlertsOut");
     if (!root) return;
-
-    root.onclick = async (ev) => {
-      const editBtn = ev.target && ev.target.closest ? ev.target.closest('button[data-alert-edit="1"]') : null;
-      if (!editBtn) return;
-
-      const alertId = editBtn.getAttribute("data-alert-id") || "";
-      const cell = editBtn.closest('td[data-alert-status-cell="1"]');
-      if (!alertId || !cell) return;
-
-      const textEl = cell.querySelector('[data-alert-status-text="1"]');
-      const current = textEl ? (textEl.textContent || "").trim().toLowerCase() : "new";
-
-      cell.innerHTML = `
-        <select data-alert-status-select="1" style="padding:2px 8px; border-radius:999px; border:1px solid #ddd; font-size:12px;">
-          <option value="new">Новый</option>
-          <option value="ack">В работе</option>
-          <option value="closed">Закрыт</option>
-        </select>
-        <button data-alert-save="1" data-alert-id="${escapeHtml(alertId)}" style="margin-left:6px; padding:2px 8px; border-radius:999px; border:1px solid #ddd; cursor:pointer;">Сохранить</button>
-        <button data-alert-cancel="1" style="margin-left:6px; padding:2px 8px; border-radius:999px; border:1px solid #ddd; cursor:pointer;">Отмена</button>
-      `;
-
-      const sel = cell.querySelector('select[data-alert-status-select="1"]');
-      if (sel) sel.value = current || "new";
-    };
+    if (root.dataset.alertEditorBound === "1") return;
+    root.dataset.alertEditorBound = "1";
 
     root.addEventListener("click", async (ev) => {
+      const editBtn = ev.target && ev.target.closest ? ev.target.closest('button[data-alert-edit="1"]') : null;
+      if (editBtn) {
+        const alertId = editBtn.getAttribute("data-alert-id") || "";
+        const cell = editBtn.closest('td[data-alert-status-cell="1"]');
+        if (!alertId || !cell) return;
+
+        const textEl = cell.querySelector('[data-alert-status-text="1"]');
+        const current = textEl ? (textEl.textContent || "").trim().toLowerCase() : "new";
+
+        cell.innerHTML = `
+          <select data-alert-status-select="1" style="padding:2px 8px; border-radius:999px; border:1px solid #ddd; font-size:12px;">
+            <option value="new">new</option>
+            <option value="ack">ack</option>
+            <option value="closed">closed</option>
+          </select>
+          <button data-alert-save="1" data-alert-id="${escapeHtml(alertId)}" style="margin-left:6px; padding:2px 8px; border-radius:999px; border:1px solid #ddd; cursor:pointer;">Сохранить</button>
+          <button data-alert-cancel="1" style="margin-left:6px; padding:2px 8px; border-radius:999px; border:1px solid #ddd; cursor:pointer;">Отмена</button>
+        `;
+
+        const sel = cell.querySelector('select[data-alert-status-select="1"]');
+        if (sel) sel.value = current || "new";
+        return;
+      }
+
       const saveBtn = ev.target && ev.target.closest ? ev.target.closest('button[data-alert-save="1"]') : null;
       if (saveBtn) {
         const alertId = saveBtn.getAttribute("data-alert-id") || "";
@@ -1383,12 +1385,12 @@ async function loadChainsList() {
     `;
   }
 
-   async function loadChainProfile() {
+  async function loadChainProfile() {
     const host = hostSel.value || "";
     const days = Number(byId("anDays")?.value || 14) || 14;
     const selectedChain = chainSel.value || "";
 
-    if (!selectedChain) return `<div class="card"><div class="muted">Выберите цепочку.</div></div>`;
+    if (!selectedChain) return `<div class="card"><div class="muted">Выберите цепочку</div></div>`;
 
     const q = new URLSearchParams();
     q.set("days", String(days));
@@ -1449,6 +1451,7 @@ async function loadChainsList() {
   await loadProcesses();
   await loadChainsList();
   await refreshAnalytics();
+  wireAlertsEditor();
 }
 
   // Settings tab
@@ -1478,11 +1481,17 @@ async function loadChainsList() {
         <h3 style="margin-top:0;">Справочник процессов</h3>
         <div id="setCatalog"></div>
       </div>
+      <div class="card" style="margin-top:12px;">
+        <h3 style="margin-top:0;">Справочник цепочек</h3>
+        <div id="setChainCatalog"></div>
+      </div>
+
     `;
 
     const machinesEl = byId("setMachines");
     const rolesEl = byId("setRoles");
     const catalogEl = byId("setCatalog");
+    const chainCatalogEl = byId("setChainCatalog");
     const addRoleBtn = byId("addRoleBtn");
     const roleAddForm = byId("roleAddForm");
 
@@ -1501,9 +1510,19 @@ async function loadChainsList() {
       return data.items || [];
     }
 
+    async function loadChainCatalog() {
+      const data = await apiGetJson("/api/chain-catalog");
+      return data.items || [];
+    }
+
     async function paint() {
       try {
-        const [machines, roles, catalog] = await Promise.all([loadMachines(), loadRoles(), loadCatalog()]);
+        const [machines, roles, catalog, chainCatalog] = await Promise.all([
+          loadMachines(),
+          loadRoles(),
+          loadCatalog(),
+          loadChainCatalog()
+        ]);
 
         // Machines
         const rolesById = {};
@@ -1725,6 +1744,68 @@ async function loadChainsList() {
           };
         }
 
+                chainCatalogEl.innerHTML = `
+          <div class="badge" style="margin-bottom:10px; display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+            <button id="chainCatAddBtn" style="padding:6px 10px; border-radius:999px; border:1px solid #ddd; cursor:pointer;">+ Добавить/обновить</button>
+            <span class="muted">(ввод: chain_name, chain_key, type, description)</span>
+          </div>
+          <div id="chainCatEditor" style="display:none; margin-bottom:10px;"></div>
+          <table>
+            <thead><tr><th>chain_name</th><th>chain_key</th><th>type</th><th>description</th><th></th></tr></thead>
+            <tbody>
+              ${chainCatalog.map(c => `<tr>
+                <td><b>${escapeHtml(c.chain_name || "")}</b></td>
+                <td class="mono">${escapeHtml(c.chain_key || "")}</td>
+                <td class="muted">${escapeHtml(c.chain_type || "")}</td>
+                <td class="muted">${escapeHtml(c.description || "")}</td>
+                <td><button data-chain-cat-edit="1" data-chain-key="${escapeHtml(c.chain_key || "")}" style="padding:2px 8px; border-radius:999px; border:1px solid #ddd; cursor:pointer;">✏️</button></td>
+              </tr>`).join("") || `<tr><td colspan="5" class="muted">Справочник цепочек пуст</td></tr>`}
+            </tbody>
+          </table>
+        `;
+
+        const chainEditor = chainCatalogEl.querySelector('#chainCatEditor');
+        const chainAddBtn = chainCatalogEl.querySelector('#chainCatAddBtn');
+
+        if (chainAddBtn && chainEditor) {
+          chainAddBtn.onclick = () => {
+            chainEditor.style.display = '';
+            renderChainCatalogEditor(chainEditor, { chain_name: '', chain_key: '', chain_type: '', description: '' });
+            wireChainCatalogEditor(chainEditor);
+          };
+        }
+
+        chainCatalogEl.onclick = (ev) => {
+          const btn = ev.target && ev.target.closest ? ev.target.closest('button[data-chain-cat-edit="1"]') : null;
+          if (!btn || !chainEditor) return;
+          const chainKey = btn.dataset.chainKey || '';
+          const row = (chainCatalog || []).find(x => String(x.chain_key || '') === chainKey) || { chain_name: '', chain_key: chainKey, chain_type: '', description: '' };
+          chainEditor.style.display = '';
+          renderChainCatalogEditor(chainEditor, row);
+          wireChainCatalogEditor(chainEditor);
+        };
+
+        function wireChainCatalogEditor(ed) {
+          const save = ed.querySelector('#chainCatSave');
+          const cancel = ed.querySelector('#chainCatCancel');
+          const nameEl = ed.querySelector('#chainCatName');
+          const keyEl = ed.querySelector('#chainCatKey');
+          const typeEl = ed.querySelector('#chainCatType');
+          const descEl = ed.querySelector('#chainCatDesc');
+
+          if (cancel) cancel.onclick = () => { ed.style.display = 'none'; ed.innerHTML = ''; };
+          if (save) save.onclick = async () => {
+            const chain_name = (nameEl && nameEl.value ? nameEl.value : '').trim();
+            const chain_key = (keyEl && keyEl.value ? keyEl.value : '').trim();
+            const chain_type = (typeEl && typeEl.value ? typeEl.value : '').trim();
+            const description = (descEl && descEl.value ? descEl.value : '').trim();
+
+            if (!chain_name || !chain_key) return;
+            await apiPostJson('/api/chain-catalog-item', { chain_name, chain_key, chain_type, description });
+            await paint();
+          };
+        }
+
       } catch (e) {
         root.insertAdjacentHTML("beforeend", `<div class="error">Ошибка настроек: ${escapeHtml(e.message || String(e))}</div>`);
       }
@@ -1780,6 +1861,20 @@ async function loadChainsList() {
         <input id="catProcDesc" type="text" placeholder="description" value="${escapeHtml(val.description || "")}" style="flex:1; min-width:260px; padding:6px 10px; border-radius:999px; border:1px solid #ddd;" />
         <button id="catSave" style="padding:6px 10px; border-radius:999px; border:1px solid #ddd; cursor:pointer;">Сохранить</button>
         <button id="catCancel" style="padding:6px 10px; border-radius:999px; border:1px solid #ddd; cursor:pointer;">Отмена</button>
+      </div>
+    `;
+  }
+
+  function renderChainCatalogEditor(container, initial) {
+    const val = initial || { chain_name: "", chain_key: "", chain_type: "", description: "" };
+    container.innerHTML = `
+      <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+        <input id="chainCatName" type="text" placeholder="chain_name" value="${escapeHtml(val.chain_name || "")}" style="width:220px; padding:6px 10px; border-radius:999px; border:1px solid #ddd;" />
+        <input id="chainCatKey" type="text" placeholder="chain_key" value="${escapeHtml(val.chain_key || "")}" style="width:360px; padding:6px 10px; border-radius:999px; border:1px solid #ddd;" />
+        <input id="chainCatType" type="text" placeholder="type" value="${escapeHtml(val.chain_type || "")}" style="width:180px; padding:6px 10px; border-radius:999px; border:1px solid #ddd;" />
+        <input id="chainCatDesc" type="text" placeholder="description" value="${escapeHtml(val.description || "")}" style="flex:1; min-width:260px; padding:6px 10px; border-radius:999px; border:1px solid #ddd;" />
+        <button id="chainCatSave" style="padding:6px 10px; border-radius:999px; border:1px solid #ddd; cursor:pointer;">Сохранить</button>
+        <button id="chainCatCancel" style="padding:6px 10px; border-radius:999px; border:1px solid #ddd; cursor:pointer;">Отмена</button>
       </div>
     `;
   }
