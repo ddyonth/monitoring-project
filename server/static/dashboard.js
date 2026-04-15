@@ -1073,6 +1073,53 @@ function getProcType(name) {
 
   // Analytics tab
 
+  function applyCollapsibleTables(scopeEl, maxRows = 2) {
+    if (!scopeEl) return;
+
+    const tables = Array.from(scopeEl.querySelectorAll("table"));
+    tables.forEach((table, idx) => {
+      const tbody = table.querySelector("tbody");
+      if (!tbody) return;
+
+      const rows = Array.from(tbody.querySelectorAll(":scope > tr"));
+      if (rows.length <= maxRows) return;
+
+      const tableId = table.dataset.collapseId || `tbl_${idx}_${Math.random().toString(36).slice(2, 8)}`;
+      table.dataset.collapseId = tableId;
+
+      const wrap = table.closest(".tableWrap") || table.parentElement;
+      if (!wrap) return;
+
+      const oldToggle = scopeEl.querySelector(`[data-collapse-toggle-for="${tableId}"]`);
+      if (oldToggle) oldToggle.remove();
+
+      let expanded = false;
+
+      const applyState = () => {
+        rows.forEach((row, i) => {
+          row.style.display = (expanded || i < maxRows) ? "" : "none";
+        });
+        toggle.textContent = expanded ? "(Свернуть)" : "(Развернуть)";
+      };
+
+      const toggle = document.createElement("button");
+      toggle.type = "button";
+      toggle.setAttribute("data-collapse-toggle-for", tableId);
+      toggle.style.marginTop = "8px";
+      toggle.style.padding = "2px 8px";
+      toggle.style.borderRadius = "999px";
+      toggle.style.border = "1px solid #ddd";
+      toggle.style.cursor = "pointer";
+      toggle.addEventListener("click", () => {
+        expanded = !expanded;
+        applyState();
+      });
+
+      wrap.insertAdjacentElement("afterend", toggle);
+      applyState();
+    });
+  }
+
  async function renderAnalytics() {
   const root = byId("analyticsRoot");
   if (!root) return;
@@ -1448,6 +1495,8 @@ function getProcType(name) {
 
       alertsOut.innerHTML = alertsHtml;
       profilesOut.innerHTML = profileHtml;
+      applyCollapsibleTables(alertsOut, 2);
+      applyCollapsibleTables(profilesOut, 2);
 
     } catch (e) {
       alertsOut.innerHTML = `<div class="error">Ошибка аналитики: ${escapeHtml(e.message || String(e))}</div>`;
@@ -1460,6 +1509,12 @@ function getProcType(name) {
   hostSel.addEventListener("change", refreshAnalytics);
   procSel.addEventListener("change", refreshAnalytics);
   chainSel.addEventListener("change", refreshAnalytics);
+  if (alertMachineSel) alertMachineSel.addEventListener("change", refreshAnalytics);
+  if (byId("alPeriod")) byId("alPeriod").addEventListener("change", refreshAnalytics);
+  if (byId("alStatus")) byId("alStatus").addEventListener("change", refreshAnalytics);
+  if (byId("alSeverity")) byId("alSeverity").addEventListener("change", refreshAnalytics);
+  if (byId("alEntityType")) byId("alEntityType").addEventListener("change", refreshAnalytics);
+  if (byId("alRuleType")) byId("alRuleType").addEventListener("change", refreshAnalytics);
   byId("anDays").addEventListener("change", async () => {
     await loadChainsList();
     await refreshAnalytics();
@@ -1823,6 +1878,10 @@ function getProcType(name) {
             await paint();
           };
         }
+        applyCollapsibleTables(machinesEl, 2);
+        applyCollapsibleTables(rolesEl, 2);
+        applyCollapsibleTables(catalogEl, 2);
+        applyCollapsibleTables(chainCatalogEl, 2);
 
       } catch (e) {
         root.insertAdjacentHTML("beforeend", `<div class="error">Ошибка настроек: ${escapeHtml(e.message || String(e))}</div>`);
