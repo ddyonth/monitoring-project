@@ -906,7 +906,14 @@ def get_roles(x_api_key: Optional[str] = Header(default=None)):
     require_api_key(x_api_key)
     conn = db_connect()
     cur = conn.cursor()
-    cur.execute("SELECT role_id, role_name, description FROM roles ORDER BY role_name;")
+    cur.execute(
+        """
+        SELECT r.role_id, r.role_name, r.description, rp.allowed_types_json
+        FROM roles r
+        LEFT JOIN role_profiles rp ON rp.role_id = r.role_id
+        ORDER BY r.role_name
+        """
+    )
     roles = [dict(r) for r in cur.fetchall()]
     conn.close()
     return {"items": roles}
@@ -917,19 +924,36 @@ def create_role(payload: Dict[str, Any] = Body(...), x_api_key: Optional[str] = 
     require_api_key(x_api_key)
     role_name = str(payload.get("role_name", "")).strip()
     description = str(payload.get("description", "") or "").strip()
+    allowed_types_json = str(payload.get("allowed_types_json", "") or "").strip()
     if not role_name:
         raise HTTPException(status_code=400, detail="role_name is required")
+
     conn = db_connect()
     cur = conn.cursor()
     try:
-        cur.execute("INSERT INTO roles(role_name, description) VALUES(?, ?);", (role_name, description))
-        conn.commit()
-        rid = cur.lastrowid
-    except sqlite3.IntegrityError:
-        cur.execute("SELECT role_id FROM roles WHERE role_name=? LIMIT 1;", (role_name,))
-        row = cur.fetchone()
-        rid = int(row["role_id"]) if row else None
-        conn.commit()
+        try:
+            cur.execute("INSERT INTO roles(role_name, description) VALUES(?, ?);", (role_name, description))
+            conn.commit()
+            rid = cur.lastrowid
+        except sqlite3.IntegrityError:
+            cur.execute("SELECT role_id FROM roles WHERE role_name=? LIMIT 1;", (role_name,))
+            row = cur.fetchone()
+            rid = int(row["role_id"]) if row else None
+            conn.commit()
+
+        if rid is not None and allowed_types_json:
+            now = datetime.now().isoformat(timespec="seconds")
+            cur.execute(
+                """
+                INSERT INTO role_profiles(role_id, allowed_hashes_json, allowed_types_json, updated_at)
+                VALUES(?, NULL, ?, ?)
+                ON CONFLICT(role_id) DO UPDATE SET
+                    allowed_types_json=excluded.allowed_types_json,
+                    updated_at=excluded.updated_at
+                """,
+                (int(rid), allowed_types_json, now),
+            )
+            conn.commit()
     finally:
         conn.close()
     return {"ok": True, "role_id": rid}
@@ -940,6 +964,7 @@ def update_role(payload: Dict[str, Any] = Body(...), x_api_key: Optional[str] = 
     role_id = payload.get("role_id", None)
     role_name = payload.get("role_name", None)
     description = str(payload.get("description", "") or "").strip()
+    allowed_types_json = payload.get("allowed_types_json", None)
     if role_id is None:
         raise HTTPException(status_code=400, detail="role_id is required")
 
@@ -954,6 +979,19 @@ def update_role(payload: Dict[str, Any] = Body(...), x_api_key: Optional[str] = 
             if not rn:
                 raise HTTPException(status_code=400, detail="role_name is required")
             cur.execute("UPDATE roles SET role_name=?, description=? WHERE role_id=?;", (rn, description, int(role_id)))
+        if allowed_types_json is not None:
+            allowed_types_str = str(allowed_types_json).strip()
+            now = datetime.now().isoformat(timespec="seconds")
+            cur.execute(
+                """
+                INSERT INTO role_profiles(role_id, allowed_hashes_json, allowed_types_json, updated_at)
+                VALUES(?, NULL, ?, ?)
+                ON CONFLICT(role_id) DO UPDATE SET
+                    allowed_types_json=excluded.allowed_types_json,
+                    updated_at=excluded.updated_at
+                """,
+                (int(role_id), allowed_types_str or None, now),
+            )
         conn.commit()
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=400, detail="role_name must be unique")
@@ -1446,6 +1484,49 @@ def _chain_in_catalog(cur: sqlite3.Cursor, chain_key: str) -> bool:
     cur.execute("SELECT 1 FROM chain_catalog WHERE chain_key=? LIMIT 1;", (chain_key,))
     return cur.fetchone() is not None
 
+def _get_machine_role_profile(cur: sqlite3.Cursor, machine_name: str) -> Optional[Dict[str, Any]]:
+    cur.execute(
+        """
+        SELECT r.role_id, r.role_name, rp.allowed_types_json
+        FROM machine_roles mr
+        JOIN roles r ON r.role_id = mr.role_id
+        LEFT JOIN role_profiles rp ON rp.role_id = r.role_id
+        WHERE mr.machine_name = ?
+        LIMIT 1
+        """,
+        (machine_name,),
+    )
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+def _get_process_type(cur: sqlite3.Cursor, process_name: str) -> str:
+    cur.execute(
+        """
+        SELECT process_type
+        FROM process_catalog
+        WHERE lower(process_name) = lower(?)
+        LIMIT 1
+        """,
+        (process_name.strip(),),
+    )
+    row = cur.fetchone()
+    return str(row["process_type"] or "").strip() if row else ""
+
+def _parse_allowed_types_json(raw: Any) -> List[str]:
+    if raw is None:
+        return []
+    try:
+        data = json.loads(str(raw))
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    out = []
+    for x in data:
+        s = str(x or "").strip()
+        if s:
+            out.append(s)
+    return out
 
 def _typical_hours_for_process(
     cur: sqlite3.Cursor,
@@ -1730,6 +1811,41 @@ def detect_alerts_for_ingested_events(events_payload: List[Dict[str, Any]]) -> i
                         "score": None,
                         "severity": sev,
                         "reason": reason,
+                        "status": "new",
+                        "bucket_hour": bucket_hour,
+                    })
+
+        role_profile = _get_machine_role_profile(cur, machine)
+        if role_profile:
+            allowed_types = _parse_allowed_types_json(role_profile.get("allowed_types_json"))
+            process_type = _get_process_type(cur, process_name)
+
+            if allowed_types and process_type:
+                allowed_norm = {x.strip().lower() for x in allowed_types if str(x).strip()}
+                proc_type_norm = process_type.strip().lower()
+
+                if proc_type_norm not in allowed_norm:
+                    session_alerts.append({
+                        "created_at": now_iso,
+                        "sample_time": until_iso,
+                        "machine_name": machine,
+                        "user_name": user_name,
+                        "entity_type": "process_session",
+                        "process_name": process_name,
+                        "pid": int(latest["pid"] or 0) if latest["pid"] is not None else None,
+                        "start_time": str(latest["start_time"]) if latest["start_time"] is not None else None,
+                        "sha256": sha256 or None,
+                        "exe_path": exe_path or None,
+                        "parent_process_name": None,
+                        "parent_sha256": None,
+                        "parent_exe_path": None,
+                        "chain_key": None,
+                        "metric": "role_type_mismatch",
+                        "value": None,
+                        "baseline": None,
+                        "score": None,
+                        "severity": "med",
+                        "reason": f"Тип процесса {process_type} не разрешён для роли {role_profile.get('role_name') or 'unknown'}.",
                         "status": "new",
                         "bucket_hour": bucket_hour,
                     })

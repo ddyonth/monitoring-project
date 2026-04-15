@@ -1693,14 +1693,15 @@ function getProcType(name) {
         // Roles
         rolesEl.innerHTML = `
           <table>
-            <thead><tr><th>role_id</th><th>role_name</th><th>description</th><th></th></tr></thead>
+            <thead><tr><th>role_id</th><th>role_name</th><th>description</th><th>allowed_types</th><th></th></tr></thead>
             <tbody>
-              ${roles.map(r => `<tr data-role-row="1" data-role-id="${escapeHtml(String(r.role_id ?? ""))}">
-                <td class="muted">${escapeHtml(r.role_id ?? "")}</td>
-                <td data-role-name-cell="1"><b>${escapeHtml(r.role_name || "")}</b></td>
-                <td class="muted" data-role-desc-cell="1">${escapeHtml(r.description || "")}</td>
-                <td data-role-act-cell="1"><button data-role-edit="1" style="padding:2px 10px; border-radius:999px; border:1px solid #ddd; cursor:pointer;">✏️</button></td>
-              </tr>`).join("") || `<tr><td colspan="4" class="muted">Нет ролей</td></tr>`}
+                ${roles.map(r => `<tr data-role-row="1" data-role-id="${escapeHtml(String(r.role_id ?? ""))}">
+                  <td class="muted">${escapeHtml(r.role_id ?? "")}</td>
+                  <td data-role-name-cell="1"><b>${escapeHtml(r.role_name || "")}</b></td>
+                  <td class="muted" data-role-desc-cell="1">${escapeHtml(r.description || "")}</td>
+                  <td class="mono" data-role-types-cell="1">${escapeHtml(r.allowed_types_json || "")}</td>
+                  <td data-role-act-cell="1"><button data-role-edit="1" style="padding:2px 10px; border-radius:999px; border:1px solid #ddd; cursor:pointer;">✏️</button></td>
+                </tr>`).join("") || `<tr><td colspan="5" class="muted">Нет ролей</td></tr>`}
             </tbody>
           </table>
         `;
@@ -1719,10 +1720,12 @@ function getProcType(name) {
 
             const nameCell = row.querySelector('td[data-role-name-cell="1"]');
             const descCell = row.querySelector('td[data-role-desc-cell="1"]');
+            const typesCell = row.querySelector('td[data-role-types-cell="1"]');
             const actCell = row.querySelector('td[data-role-act-cell="1"]');
 
             const oldName = nameCell ? (nameCell.textContent || "") : "";
             const oldDesc = descCell ? (descCell.textContent || "") : "";
+            const oldTypes = typesCell ? (typesCell.textContent || "") : "";
 
             if (nameCell) {
               nameCell.innerHTML = `<input data-role-name-input="1" type="text" value="${escapeHtml(oldName.trim())}" style="width:240px; padding:4px 8px; border-radius:8px; border:1px solid #ddd; font-size:12px;" />`;
@@ -1730,6 +1733,10 @@ function getProcType(name) {
             if (descCell) {
               descCell.classList.remove("muted");
               descCell.innerHTML = `<input data-role-desc-input="1" type="text" value="${escapeHtml(oldDesc.trim())}" style="width:420px; padding:4px 8px; border-radius:8px; border:1px solid #ddd; font-size:12px;" />`;
+            }
+            if (typesCell) {
+              typesCell.classList.remove("mono");
+              typesCell.innerHTML = `<textarea data-role-types-input="1" style="width:420px; min-height:72px; padding:4px 8px; border-radius:8px; border:1px solid #ddd; font-size:12px; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;">${escapeHtml(oldTypes.trim())}</textarea>`;
             }
             if (actCell) {
               actCell.innerHTML = `
@@ -1748,13 +1755,15 @@ function getProcType(name) {
           if (t.closest && t.closest('button[data-role-save="1"]')) {
             const nameEl = row.querySelector('input[data-role-name-input="1"]');
             const descEl = row.querySelector('input[data-role-desc-input="1"]');
+            const typesEl = row.querySelector('textarea[data-role-types-input="1"]');
             const role_name = (nameEl && nameEl.value != null) ? String(nameEl.value).trim() : "";
             const description = (descEl && descEl.value != null) ? String(descEl.value).trim() : "";
+            const allowed_types_json = (typesEl && typesEl.value != null) ? String(typesEl.value).trim() : "";
 
             if (!rid) return;
             if (!role_name) return;
 
-            await apiPostJson("/api/role", { role_id: Number(rid), role_name, description });
+            await apiPostJson("/api/role", {role_id: Number(rid), role_name, description, allowed_types_json});
             await paint();
             return;
           }
