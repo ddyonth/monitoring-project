@@ -257,8 +257,18 @@ def ensure_schema() -> None:
         CREATE TABLE IF NOT EXISTS role_profiles (
             role_id INTEGER PRIMARY KEY,
             allowed_hashes_json TEXT,
-            allowed_types_json TEXT,
             updated_at TEXT,
+            FOREIGN KEY(role_id) REFERENCES roles(role_id)
+        );
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS role_allowed_process_types (
+            role_id INTEGER NOT NULL,
+            process_type TEXT NOT NULL,
+            updated_at TEXT,
+            PRIMARY KEY(role_id, process_type),
             FOREIGN KEY(role_id) REFERENCES roles(role_id)
         );
         """
@@ -908,13 +918,19 @@ def get_roles(x_api_key: Optional[str] = Header(default=None)):
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT r.role_id, r.role_name, r.description, rp.allowed_types_json
+        SELECT r.role_id, r.role_name, r.description
         FROM roles r
-        LEFT JOIN role_profiles rp ON rp.role_id = r.role_id
         ORDER BY r.role_name
         """
     )
-    roles = [dict(r) for r in cur.fetchall()]
+    roles = []
+    for row in cur.fetchall():
+        item = dict(row)
+        allowed_process_types = _get_role_allowed_process_types(cur, int(item["role_id"]))
+        item["allowed_process_types"] = allowed_process_types
+        item["allowed_types_text"] = ", ".join(allowed_process_types)
+        roles.append(item)
+
     conn.close()
     return {"items": roles}
 
@@ -924,7 +940,8 @@ def create_role(payload: Dict[str, Any] = Body(...), x_api_key: Optional[str] = 
     require_api_key(x_api_key)
     role_name = str(payload.get("role_name", "")).strip()
     description = str(payload.get("description", "") or "").strip()
-    allowed_types_json = str(payload.get("allowed_types_json", "") or "").strip()
+    allowed_process_types = payload.get("allowed_process_types", [])
+    has_allowed_process_types = "allowed_process_types" in payload
     if not role_name:
         raise HTTPException(status_code=400, detail="role_name is required")
 
@@ -941,18 +958,8 @@ def create_role(payload: Dict[str, Any] = Body(...), x_api_key: Optional[str] = 
             rid = int(row["role_id"]) if row else None
             conn.commit()
 
-        if rid is not None and allowed_types_json:
-            now = datetime.now().isoformat(timespec="seconds")
-            cur.execute(
-                """
-                INSERT INTO role_profiles(role_id, allowed_hashes_json, allowed_types_json, updated_at)
-                VALUES(?, NULL, ?, ?)
-                ON CONFLICT(role_id) DO UPDATE SET
-                    allowed_types_json=excluded.allowed_types_json,
-                    updated_at=excluded.updated_at
-                """,
-                (int(rid), allowed_types_json, now),
-            )
+        if rid is not None and has_allowed_process_types:
+            _replace_role_allowed_process_types(cur, int(rid), allowed_process_types)
             conn.commit()
     finally:
         conn.close()
@@ -964,7 +971,7 @@ def update_role(payload: Dict[str, Any] = Body(...), x_api_key: Optional[str] = 
     role_id = payload.get("role_id", None)
     role_name = payload.get("role_name", None)
     description = str(payload.get("description", "") or "").strip()
-    allowed_types_json = payload.get("allowed_types_json", None)
+    allowed_process_types = payload.get("allowed_process_types", None)
     if role_id is None:
         raise HTTPException(status_code=400, detail="role_id is required")
 
@@ -979,19 +986,8 @@ def update_role(payload: Dict[str, Any] = Body(...), x_api_key: Optional[str] = 
             if not rn:
                 raise HTTPException(status_code=400, detail="role_name is required")
             cur.execute("UPDATE roles SET role_name=?, description=? WHERE role_id=?;", (rn, description, int(role_id)))
-        if allowed_types_json is not None:
-            allowed_types_str = str(allowed_types_json).strip()
-            now = datetime.now().isoformat(timespec="seconds")
-            cur.execute(
-                """
-                INSERT INTO role_profiles(role_id, allowed_hashes_json, allowed_types_json, updated_at)
-                VALUES(?, NULL, ?, ?)
-                ON CONFLICT(role_id) DO UPDATE SET
-                    allowed_types_json=excluded.allowed_types_json,
-                    updated_at=excluded.updated_at
-                """,
-                (int(role_id), allowed_types_str or None, now),
-            )
+            if allowed_process_types is not None:
+                _replace_role_allowed_process_types(cur, int(role_id), allowed_process_types)
         conn.commit()
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=400, detail="role_name must be unique")
@@ -1487,17 +1483,23 @@ def _chain_in_catalog(cur: sqlite3.Cursor, chain_key: str) -> bool:
 def _get_machine_role_profile(cur: sqlite3.Cursor, machine_name: str) -> Optional[Dict[str, Any]]:
     cur.execute(
         """
-        SELECT r.role_id, r.role_name, rp.allowed_types_json
+        SELECT r.role_id, r.role_name
         FROM machine_roles mr
         JOIN roles r ON r.role_id = mr.role_id
-        LEFT JOIN role_profiles rp ON rp.role_id = r.role_id
         WHERE mr.machine_name = ?
         LIMIT 1
         """,
         (machine_name,),
     )
     row = cur.fetchone()
-    return dict(row) if row else None
+    if not row:
+        return None
+
+    item = dict(row)
+    allowed_process_types = _get_role_allowed_process_types(cur, int(item["role_id"]))
+    item["allowed_process_types"] = allowed_process_types
+    item["allowed_types_text"] = ", ".join(allowed_process_types)
+    return item
 
 def _get_process_type(cur: sqlite3.Cursor, process_name: str) -> str:
     cur.execute(
@@ -1512,21 +1514,60 @@ def _get_process_type(cur: sqlite3.Cursor, process_name: str) -> str:
     row = cur.fetchone()
     return str(row["process_type"] or "").strip() if row else ""
 
-def _parse_allowed_types_json(raw: Any) -> List[str]:
+def _normalize_allowed_process_types(raw: Any) -> List[str]:
     if raw is None:
         return []
-    try:
-        data = json.loads(str(raw))
-    except Exception:
-        return []
-    if not isinstance(data, list):
-        return []
-    out = []
-    for x in data:
+
+    if isinstance(raw, list):
+        items = raw
+    else:
+        items = str(raw).split(",")
+
+    out: List[str] = []
+    seen = set()
+
+    for x in items:
         s = str(x or "").strip()
-        if s:
-            out.append(s)
+        if not s:
+            continue
+        key = s.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
     return out
+
+
+def _get_role_allowed_process_types(cur: sqlite3.Cursor, role_id: int) -> List[str]:
+    cur.execute(
+        """
+        SELECT process_type
+        FROM role_allowed_process_types
+        WHERE role_id = ?
+        ORDER BY process_type COLLATE NOCASE
+        """,
+        (int(role_id),),
+    )
+    rows = cur.fetchall()
+    return [str(row["process_type"]).strip() for row in rows if str(row["process_type"] or "").strip()]
+
+
+def _replace_role_allowed_process_types(cur: sqlite3.Cursor, role_id: int, raw: Any) -> List[str]:
+    allowed_process_types = _normalize_allowed_process_types(raw)
+    cur.execute("DELETE FROM role_allowed_process_types WHERE role_id=?;", (int(role_id),))
+
+    if not allowed_process_types:
+        return []
+
+    now = datetime.now().isoformat(timespec="seconds")
+    cur.executemany(
+        """
+        INSERT INTO role_allowed_process_types(role_id, process_type, updated_at)
+        VALUES(?, ?, ?)
+        """,
+        [(int(role_id), process_type, now) for process_type in allowed_process_types],
+    )
+    return allowed_process_types
 
 def _typical_hours_for_process(
     cur: sqlite3.Cursor,
@@ -1817,7 +1858,7 @@ def detect_alerts_for_ingested_events(events_payload: List[Dict[str, Any]]) -> i
 
         role_profile = _get_machine_role_profile(cur, machine)
         if role_profile:
-            allowed_types = _parse_allowed_types_json(role_profile.get("allowed_types_json"))
+            allowed_types = role_profile.get("allowed_process_types") or []
             process_type = _get_process_type(cur, process_name)
 
             if allowed_types and process_type:

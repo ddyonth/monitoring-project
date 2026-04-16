@@ -1568,6 +1568,24 @@ function getProcType(name) {
     const addRoleBtn = byId("addRoleBtn");
     const roleAddForm = byId("roleAddForm");
 
+    function parseAllowedProcessTypes(raw) {
+      const out = [];
+      const seen = new Set();
+
+      for (const part of String(raw || "").split(",")) {
+        const value = String(part || "").trim();
+        if (!value) continue;
+
+        const key = value.toLowerCase();
+        if (seen.has(key)) continue;
+
+        seen.add(key);
+        out.push(value);
+      }
+
+      return out;
+    }
+
     async function loadRoles() {
       const data = await apiGetJson("/api/roles");
       return data.items || [];
@@ -1699,7 +1717,7 @@ function getProcType(name) {
                   <td class="muted">${escapeHtml(r.role_id ?? "")}</td>
                   <td data-role-name-cell="1"><b>${escapeHtml(r.role_name || "")}</b></td>
                   <td class="muted" data-role-desc-cell="1">${escapeHtml(r.description || "")}</td>
-                  <td class="mono" data-role-types-cell="1">${escapeHtml(r.allowed_types_json || "")}</td>
+                  <td class="mono" data-role-types-cell="1">${escapeHtml(r.allowed_types_text || "")}</td>
                   <td data-role-act-cell="1"><button data-role-edit="1" style="padding:2px 10px; border-radius:999px; border:1px solid #ddd; cursor:pointer;">✏️</button></td>
                 </tr>`).join("") || `<tr><td colspan="5" class="muted">Нет ролей</td></tr>`}
             </tbody>
@@ -1758,12 +1776,12 @@ function getProcType(name) {
             const typesEl = row.querySelector('textarea[data-role-types-input="1"]');
             const role_name = (nameEl && nameEl.value != null) ? String(nameEl.value).trim() : "";
             const description = (descEl && descEl.value != null) ? String(descEl.value).trim() : "";
-            const allowed_types_json = (typesEl && typesEl.value != null) ? String(typesEl.value).trim() : "";
+            const allowed_process_types = parseAllowedProcessTypes((typesEl && typesEl.value != null) ? String(typesEl.value) : "");
 
             if (!rid) return;
             if (!role_name) return;
 
-            await apiPostJson("/api/role", {role_id: Number(rid), role_name, description, allowed_types_json});
+            await apiPostJson("/api/role", {role_id: Number(rid), role_name, description, allowed_process_types});
             await paint();
             return;
           }
@@ -1906,6 +1924,7 @@ function getProcType(name) {
         <div class="badge" style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
           <input data-role-add-name="1" type="text" placeholder="role_name (например: бухгалтерия)" style="width:240px; padding:4px 8px; border-radius:8px; border:1px solid #ddd; font-size:12px;" />
           <input data-role-add-desc="1" type="text" placeholder="description (например: ПК в бухгалтерии)" style="width:360px; padding:4px 8px; border-radius:8px; border:1px solid #ddd; font-size:12px;" />
+          <input data-role-add-types="1" type="text" placeholder="allowed types (например: browser, utility, office)" style="width:360px; padding:4px 8px; border-radius:8px; border:1px solid #ddd; font-size:12px;" />
           <button data-role-add-save="1" style="padding:2px 10px; border-radius:999px; border:1px solid #ddd; cursor:pointer;">Сохранить</button>
           <button data-role-add-cancel="1" style="padding:2px 10px; border-radius:999px; border:1px solid #ddd; cursor:pointer;">Отмена</button>
         </div>
@@ -1922,10 +1941,12 @@ function getProcType(name) {
         if (t.matches('button[data-role-add-save="1"]')) {
           const nameEl = roleAddForm.querySelector('input[data-role-add-name="1"]');
           const descEl = roleAddForm.querySelector('input[data-role-add-desc="1"]');
+          const typesEl = roleAddForm.querySelector('input[data-role-add-types="1"]');
           const role_name = (nameEl && nameEl.value ? nameEl.value : "").trim();
           const description = (descEl && descEl.value ? descEl.value : "").trim();
+          const allowed_process_types = parseAllowedProcessTypes(typesEl && typesEl.value ? typesEl.value : "");
           if (!role_name) return;
-          await apiPostJson("/api/roles", { role_name, description });
+          await apiPostJson("/api/roles", { role_name, description, allowed_process_types });
           roleAddForm.innerHTML = "";
           roleAddForm.removeEventListener("click", onClick);
           await paint();
