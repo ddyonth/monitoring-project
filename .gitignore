@@ -39,3 +39,4 @@ Thumbs.db
 
 # Config (если появятся секреты)
 .env
+!README.md
