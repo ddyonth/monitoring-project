@@ -1,5 +1,7 @@
+import hashlib
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -9,8 +11,8 @@ import psycopg
 from psycopg import ClientCursor
 from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
-from fastapi import Body, FastAPI, Header, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import Body, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -283,6 +285,22 @@ def ensure_schema() -> None:
             updated_at TEXT,
             PRIMARY KEY(role_id, process_type),
             FOREIGN KEY(role_id) REFERENCES roles(role_id)
+        );
+        """
+    )
+
+    # --- client agent releases: бинарник хранится в БД, чтобы переживать
+    # пересборку Docker-образа; "текущий" релиз = последняя загруженная строка
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS client_releases (
+            id SERIAL PRIMARY KEY,
+            version TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            data BYTEA NOT NULL,
+            uploaded_at TEXT NOT NULL
         );
         """
     )
@@ -634,12 +652,11 @@ def latest(x_api_key: Optional[str] = Header(default=None), limit_machines: int 
     online_thr = int(_cfg_get("online_threshold_minutes", ONLINE_THRESHOLD_MINUTES_DEFAULT))
     online_delta = timedelta(minutes=online_thr)
 
-    cfg = _get_cfg()
-    rel = cfg.get("client_release") or {}
-    latest_client_version = str(rel.get("version") or "").strip()
-
     conn = db_connect()
     cur = conn.cursor()
+
+    rel = _get_latest_client_release(cur) or {}
+    latest_client_version = str(rel.get("version") or "").strip()
 
     cur.execute(
         """
@@ -2755,25 +2772,106 @@ def set_alert_status(
 
 
 # Client release
+#
+# Релизы агента хранятся в таблице client_releases (BYTEA), текущий — последняя
+# загруженная строка. Публикация — привилегированное действие (api_key),
+# чтение метаданных и скачивание — действия агента (client_update_key).
 
-def _release_file_path() -> str:
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "client_agent.exe")
+# "1.4", "1.4.2": числа через точку, минимум два компонента
+_CLIENT_VERSION_RE = re.compile(r"^\d+(\.\d+)+$")
+
+
+def _get_latest_client_release(cur: DbCursor) -> Optional[Dict[str, Any]]:
+    """Метаданные последнего релиза без самого бинарника; None, если релизов нет."""
+    cur.execute(
+        """
+        SELECT id, version, sha256, filename, size_bytes, uploaded_at
+        FROM client_releases
+        ORDER BY uploaded_at DESC, id DESC
+        LIMIT 1
+        """
+    )
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+
+@app.post("/api/client-release")
+def publish_client_release(
+    version: str = Form(default=""),
+    file: UploadFile = File(...),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    require_api_key(x_api_key)
+
+    v = str(version or "").strip()
+    if not _CLIENT_VERSION_RE.match(v):
+        raise HTTPException(status_code=400, detail="version must be numbers separated by dots, e.g. 1.4 or 1.4.2")
+
+    data = file.file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="file is empty")
+
+    # Хэш считается сервером от полученных байт; хэш из запроса не принимается.
+    sha = hashlib.sha256(data).hexdigest()
+    # Имя файла — только последняя компонента, разделители и Windows (\), и POSIX (/)
+    filename = re.split(r"[\\/]", str(file.filename or "").strip())[-1] or "client_agent.exe"
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO client_releases(version, sha256, filename, size_bytes, data, uploaded_at)
+        VALUES(%s, %s, %s, %s, %s, %s)
+        """,
+        (v, sha, filename, len(data), data, now),
+    )
+    conn.commit()
+    conn.close()
+    return {"ok": True, "version": v, "sha256": sha, "size_bytes": len(data)}
 
 
 @app.get("/api/client-release")
 def get_client_release(x_client_key: Optional[str] = Header(default=None)):
     require_client_key(x_client_key)
-    cfg = _get_cfg()
-    return {"client_release": cfg.get("client_release")}
+    conn = db_connect()
+    cur = conn.cursor()
+    rel = _get_latest_client_release(cur)
+    conn.close()
+    if not rel:
+        return {"client_release": None}
+    return {
+        "client_release": {
+            "version": rel["version"],
+            "sha256": rel["sha256"],
+            "size_bytes": int(rel["size_bytes"]),
+        }
+    }
 
 
 @app.get("/api/download/client-agent")
 def download_client_agent(x_client_key: Optional[str] = Header(default=None)):
     require_client_key(x_client_key)
-    p = _release_file_path()
-    if not os.path.exists(p):
-        raise HTTPException(status_code=404, detail="Client release file not found")
-    return FileResponse(path=p, filename=os.path.basename(p), media_type="application/octet-stream")
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT filename, data
+        FROM client_releases
+        ORDER BY uploaded_at DESC, id DESC
+        LIMIT 1
+        """
+    )
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Client release not found")
+    data = bytes(row["data"])
+    return Response(
+        content=data,
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{row["filename"]}"'},
+    )
 
 
 if __name__ == "__main__":
