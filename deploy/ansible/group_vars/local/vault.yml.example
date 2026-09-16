@@ -13,3 +13,7 @@ monitoring_api_key: "CHANGE_ME"
 
 # Ключ для раздачи обновлений клиента (эндпоинты /api/client-release, /api/download/client-agent)
 monitoring_client_update_key: "CHANGE_ME"
+
+# Пароль пользователя Postgres в docker compose (POSTGRES_PASSWORD в .env).
+# Задаётся при первом создании базы: чтобы сменить потом — ALTER USER в базе.
+monitoring_postgres_password: "CHANGE_ME"

@@ -140,9 +140,18 @@ docker compose run --rm tests
 
 ## Деплой сервера на Linux (Ansible)
 
-Плейбук в `deploy/ansible/` разворачивает сервер как systemd-сервис
-`monitoring-server` в `/opt/monitoring` (venv, код `server/`, `config.json`
-без секретов, unit-файл с `WorkingDirectory` и `EnvironmentFile=` на отдельный env-файл 0600 с `MONITORING_API_KEY`).
+Плейбук в `deploy/ansible/` разворачивает сервер через Docker Compose в
+`/opt/monitoring`: ставит Docker Engine и compose-plugin из официального
+apt-репозитория Docker, копирует туда `docker-compose.yml`, `server/Dockerfile`,
+`.dockerignore`, `requirements.txt` и код `server/` (те же файлы, что в
+репозитории, без изменений), рендерит `server/config.json` без секретов и
+`.env` с секретами (0600), после чего выполняет `docker compose up -d --build`.
+Образ собирается на целевом хосте, registry не нужен.
+
+Старый деплой этой же роли (venv + systemd-юнит `monitoring-server`) при первом
+прогоне останавливается, юнит отключается и удаляется; каталог
+`/opt/monitoring/venv` не трогается (на случай отката).
+
 Control node — только Linux (например, WSL2 с Ubuntu); цель — любой
 apt-based хост (Debian/Ubuntu). Сейчас в инвентаре `localhost`, для VPS см.
 комментарий в `deploy/ansible/inventory/hosts.ini`.
@@ -152,7 +161,7 @@ apt-based хост (Debian/Ubuntu). Сейчас в инвентаре `localhos
 
 ```bash
 cp deploy/ansible/group_vars/local/vault.yml.example deploy/ansible/group_vars/local/vault.yml
-# отредактировать значения monitoring_api_key / monitoring_client_update_key
+# заполнить monitoring_api_key, monitoring_client_update_key, monitoring_postgres_password
 ansible-vault encrypt deploy/ansible/group_vars/local/vault.yml
 ```
 
@@ -162,16 +171,18 @@ ansible-vault encrypt deploy/ansible/group_vars/local/vault.yml
 ansible-playbook -i deploy/ansible/inventory/hosts.ini deploy/ansible/playbook.yml --ask-vault-pass --ask-become-pass
 ```
 
-3. Проверить, что сервис жив (эндпоинта `/health` нет, дашборд отдаётся без ключа):
+3. Проверить результат:
 
 ```bash
-systemctl status monitoring-server
+sudo docker compose -f /opt/monitoring/docker-compose.yml ps   # postgres healthy, server running
 curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8000/
+systemctl status monitoring-server                             # Unit ... could not be found
 ```
 
-Повторный запуск плейбука без изменений в коде и переменных не должен
-ничего менять (идемпотентность); при изменении кода/конфига сервис
-перезапускается handler-ом.
+Повторный запуск плейбука без изменений в коде и переменных ничего не меняет:
+`docker compose up -d --build` при попадании в кэш сборки контейнеры не
+пересоздаёт. При изменении кода образ пересобирается и контейнер сервера
+пересоздаётся той же командой, отдельный рестарт не нужен.
 
 ## Примечания
 

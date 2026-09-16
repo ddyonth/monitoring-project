@@ -2,23 +2,19 @@
 # Некритичные переменные деплоя. Секретов здесь быть не должно —
 # они лежат в group_vars/local/vault.yml (зашифрован ansible-vault).
 
-# Куда разворачиваем сервер на целевом хосте
+# Куда разворачиваем сервер на целевом хосте (рабочий каталог docker compose)
 deploy_dir: /opt/monitoring
-
-# Системный интерпретатор, которым создаётся venv (пакет ставится через apt)
-python_bin: python3
-python_apt_packages:
-  - python3
-  - python3-venv
 
 # Откуда берётся код: корень репозитория относительно каталога плейбука
 monitoring_src_dir: "{{ playbook_dir }}/../.."
 
-# Пользователь, от которого работает сервис (создаётся плейбуком)
-monitoring_user: monitoring
-
-# Имя systemd-сервиса
+# Имя СТАРОГО systemd-сервиса (venv-деплой) — роль его останавливает и удаляет
 monitoring_service_name: monitoring-server
+
+# Postgres в docker compose: пользователь и имя базы (значения по умолчанию
+# как в .env.example); пароль — в vault (monitoring_postgres_password)
+postgres_user: monitoring
+postgres_db: monitoring
 
 # Параметры, которые попадают в config.json на целевом хосте
 monitoring_listen_host: 0.0.0.0

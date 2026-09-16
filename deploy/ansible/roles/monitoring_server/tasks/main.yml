@@ -1,97 +1,183 @@
 ---
-# Только OS-generic модули (apt / user / file / copy / template / pip / systemd),
-# чтобы роль работала на любом apt-based Debian/Ubuntu-хосте.
+# Только OS-generic модули (apt / apt_repository / get_url / file / copy /
+# template / systemd_service / command), чтобы роль работала на любом
+# apt-based Debian/Ubuntu-хосте. Community-коллекции и Docker SDK на целевой
+# хост не ставятся: docker compose вызывается обычной командой.
 
-- name: Install system packages (python + venv)
+# ---------------------------------------------------------------------------
+# Docker Engine из официального apt-репозитория Docker
+# (https://docs.docker.com/engine/install/ubuntu/ — те же шаги, что в документации)
+# ---------------------------------------------------------------------------
+
+- name: Install prerequisites for the Docker apt repository
   ansible.builtin.apt:
-    name: "{{ python_apt_packages }}"
+    name:
+      - ca-certificates
     state: present
     update_cache: true
     cache_valid_time: 3600
 
-- name: Create service user
-  ansible.builtin.user:
-    name: "{{ monitoring_user }}"
-    system: true
-    shell: /usr/sbin/nologin
-    home: "{{ deploy_dir }}"
-    create_home: false
+- name: Create apt keyrings directory
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+
+- name: Download Docker apt GPG key
+  ansible.builtin.get_url:
+    url: "https://download.docker.com/linux/{{ ansible_facts['distribution'] | lower }}/gpg"
+    dest: /etc/apt/keyrings/docker.asc
+    mode: "0644"
+
+- name: Get dpkg architecture
+  ansible.builtin.command:
+    cmd: dpkg --print-architecture
+  register: monitoring_server_dpkg_arch
+  changed_when: false
+
+# Строка репозитория повторяет формат из документации Docker
+# (/etc/apt/sources.list.d/docker.list); URL и suite берутся из фактов,
+# поэтому одинаково работает для Ubuntu и Debian.
+- name: Add Docker apt repository
+  ansible.builtin.apt_repository:
+    repo: >-
+      deb [arch={{ monitoring_server_dpkg_arch.stdout }} signed-by=/etc/apt/keyrings/docker.asc]
+      https://download.docker.com/linux/{{ ansible_facts['distribution'] | lower }}
+      {{ ansible_facts['distribution_release'] }} stable
+    filename: docker
+    state: present
+    update_cache: true
+
+- name: Install Docker Engine and Compose plugin
+  ansible.builtin.apt:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-compose-plugin
+    state: present
+
+- name: Enable and start Docker service
+  ansible.builtin.systemd_service:
+    name: docker
+    enabled: true
+    state: started
+
+# ---------------------------------------------------------------------------
+# Вывод из эксплуатации старого деплоя этой же роли (venv + systemd-юнит).
+# {{ deploy_dir }}/venv намеренно не трогаем — остаётся на случай отката.
+# Юнит останавливается ДО docker compose up, иначе порт 8000 будет занят.
+# ---------------------------------------------------------------------------
+
+- name: Check whether the legacy systemd unit exists
+  ansible.builtin.stat:
+    path: "/etc/systemd/system/{{ monitoring_service_name }}.service"
+  register: monitoring_server_legacy_unit
+
+- name: Stop and disable legacy systemd service
+  ansible.builtin.systemd_service:
+    name: "{{ monitoring_service_name }}"
+    state: stopped
+    enabled: false
+  when: monitoring_server_legacy_unit.stat.exists
+
+- name: Remove legacy systemd unit file
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ monitoring_service_name }}.service"
+    state: absent
+  when: monitoring_server_legacy_unit.stat.exists
+
+- name: Reload systemd after removing the legacy unit
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when: monitoring_server_legacy_unit.stat.exists
+
+# Старый файл секретов systemd-деплоя (EnvironmentFile=). Больше не
+# используется: секреты теперь в {{ deploy_dir }}/.env для docker compose.
+- name: Remove legacy systemd env file with secrets
+  ansible.builtin.file:
+    path: "{{ deploy_dir }}/server/monitoring-server.env"
+    state: absent
+
+# ---------------------------------------------------------------------------
+# Контекст сборки для docker compose в {{ deploy_dir }}: ровно те файлы,
+# которые нужны docker-compose.yml и server/Dockerfile из репозитория.
+# Файлы принадлежат root: их читает только docker daemon (работает от root),
+# отдельный сервисный пользователь больше не нужен.
+# ---------------------------------------------------------------------------
 
 - name: Create deploy directories
   ansible.builtin.file:
     path: "{{ item }}"
     state: directory
-    owner: "{{ monitoring_user }}"
-    group: "{{ monitoring_user }}"
+    owner: root
+    group: root
     mode: "0755"
   loop:
     - "{{ deploy_dir }}"
     - "{{ deploy_dir }}/server"
 
-- name: Copy requirements.txt
+# .dockerignore влияет на контекст сборки: исключает .env, venv, *.db,
+# deploy/ и т.п. — без него секреты из .env попали бы в контекст.
+- name: Copy compose file, Dockerfile and build inputs
   ansible.builtin.copy:
-    src: "{{ monitoring_src_dir }}/requirements.txt"
-    dest: "{{ deploy_dir }}/requirements.txt"
+    src: "{{ monitoring_src_dir }}/{{ item }}"
+    dest: "{{ deploy_dir }}/{{ item }}"
+    owner: root
+    group: root
     mode: "0644"
-
-- name: Create venv and install dependencies
-  ansible.builtin.pip:
-    requirements: "{{ deploy_dir }}/requirements.txt"
-    virtualenv: "{{ deploy_dir }}/venv"
-    virtualenv_command: "{{ python_bin }} -m venv"
-  notify: Restart monitoring server
+  loop:
+    - docker-compose.yml
+    - .dockerignore
+    - requirements.txt
+    - server/Dockerfile
 
 # Копируем именно код server/: server_app.py, templates/, static/.
-# server.db (данные), tests/ и __pycache__ на целевой хост не нужны,
-# config.json рендерится отдельно из шаблона.
+# tests/, requirements-dev.txt и __pycache__ не нужны: compose собирает
+# target: base, тестовая стадия в деплое не используется.
 - name: Copy server code
   ansible.builtin.copy:
     src: "{{ monitoring_src_dir }}/server/{{ item }}"
     dest: "{{ deploy_dir }}/server/{{ item }}"
-    owner: "{{ monitoring_user }}"
-    group: "{{ monitoring_user }}"
+    owner: root
+    group: root
     mode: "0644"
     directory_mode: "0755"
   loop:
     - server_app.py
     - templates/
     - static/
-  notify: Restart monitoring server
 
 - name: Render config.json (without secrets)
   ansible.builtin.template:
     src: config.json.j2
     dest: "{{ deploy_dir }}/server/config.json"
-    owner: "{{ monitoring_user }}"
-    group: "{{ monitoring_user }}"
-    mode: "0644"
-  notify: Restart monitoring server
-
-# Секреты передаются сервису только через отдельный env-файл (0600),
-# который systemd читает через EnvironmentFile=. no_log — чтобы ключ не
-# попадал в вывод ansible-playbook при -v/--diff.
-- name: Render env file with secrets
-  ansible.builtin.template:
-    src: monitoring-server.env.j2
-    dest: "{{ deploy_dir }}/server/monitoring-server.env"
-    owner: "{{ monitoring_user }}"
-    group: "{{ monitoring_user }}"
-    mode: "0600"
-  no_log: true
-  notify: Restart monitoring server
-
-- name: Install systemd unit
-  ansible.builtin.template:
-    src: monitoring-server.service.j2
-    dest: "/etc/systemd/system/{{ monitoring_service_name }}.service"
     owner: root
     group: root
-    mode: "0640"
-  notify: Restart monitoring server
+    mode: "0644"
 
-- name: Enable and start service
-  ansible.builtin.systemd_service:
-    name: "{{ monitoring_service_name }}"
-    daemon_reload: true
-    enabled: true
-    state: started
+# Секреты только в {{ deploy_dir }}/.env (0600): docker compose читает его
+# сам из рабочего каталога и передаёт в контейнеры через environment:.
+# В образ .env не попадает (исключён в .dockerignore). no_log — чтобы значения
+# не печатались в выводе ansible-playbook при -v/--diff.
+- name: Render .env for docker compose (secrets)
+  ansible.builtin.template:
+    src: .env.j2
+    dest: "{{ deploy_dir }}/.env"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+
+# changed_when: compose пишет статус в stderr. Без изменений печатается
+# "Container ... Running"; при создании/пересоздании/запуске — "Created",
+# "Recreated", "Started" (сеть/volume — тоже "Created"). Сборка образа
+# с --build выполняется каждый раз, но при попадании в кэш контейнер не
+# пересоздаётся и строк "Recreated"/"Started" не будет — поэтому по строкам
+# сборки ("Built") изменение не считаем. Проверено на docker compose v5.
+- name: Build image and start the stack with docker compose
+  ansible.builtin.command:
+    cmd: docker compose up -d --build
+    chdir: "{{ deploy_dir }}"
+  register: monitoring_server_compose_up
+  changed_when: monitoring_server_compose_up.stderr is search('(Created|Recreated|Started)')
