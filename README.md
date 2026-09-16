@@ -113,11 +113,30 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8000/
 База создаётся с локалью `C.UTF-8`: даты хранятся как TEXT в ISO-формате и
 сравниваются как строки, порядок сравнения такой же, как раньше в SQLite.
 
-Тесты внутри того же контейнерного окружения (стадия `test` в Dockerfile):
+## Тесты
+
+Тесты `server/tests` гоняются против настоящего Postgres: conftest создаёт
+отдельную базу `monitoring_test` в том же сервере (рабочие данные не трогает),
+схему создаёт `ensure_schema()`, после каждого теста таблицы очищаются
+(`TRUNCATE`). Адрес базы — `MONITORING_TEST_DATABASE_URL` или
+`MONITORING_DATABASE_URL` с суффиксом `_test`.
+
+Локально из venv (Postgres из compose слушает 127.0.0.1:5432):
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+docker compose up -d postgres
+export MONITORING_TEST_DATABASE_URL=postgresql://monitoring:пароль_бд@localhost:5432/monitoring_test
+python -m pytest server/tests -v
+```
+
+Внутри контейнера, в том же окружении, что и сервер (стадия `test` в Dockerfile):
 
 ```bash
 docker compose run --rm tests
 ```
+
+В CI (`.github/workflows/ci.yml`) Postgres поднимается как service container.
 
 ## Деплой сервера на Linux (Ansible)
 

@@ -11,6 +11,10 @@ services:
       # (BINARY). Даты хранятся как TEXT и сравниваются как строки — порядок
       # должен совпадать с прежним.
       POSTGRES_INITDB_ARGS: "--locale=C.UTF-8"
+    ports:
+      # Только localhost: нужно для локального прогона pytest из venv
+      # (тесты создают отдельную БД monitoring_test в этом же Postgres)
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql
     healthcheck:
@@ -47,6 +51,12 @@ services:
       target: test
     image: monitoring-server:test
     profiles: ["test"]
+    environment:
+      # Отдельная тестовая БД в том же Postgres; conftest создаёт её сам
+      MONITORING_TEST_DATABASE_URL: postgresql://${POSTGRES_USER:-monitoring}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-monitoring}_test
+    depends_on:
+      postgres:
+        condition: service_healthy
     command: ["python", "-m", "pytest", "tests", "-v"]
 
 volumes:

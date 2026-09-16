@@ -63,8 +63,17 @@ class TestValidateEvent:
 
 class TestInsertEvents:
     def test_unique_key_column_is_unique_in_schema(self, db):
-        row = db.execute("SELECT sql FROM sqlite_master WHERE name='events'").fetchone()
-        assert "unique_key TEXT NOT NULL UNIQUE" in row["sql"]
+        row = db.execute(
+            """
+            SELECT tc.constraint_type
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.constraint_column_usage cu
+              ON cu.constraint_name = tc.constraint_name AND cu.table_name = tc.table_name
+            WHERE tc.table_name = 'events' AND cu.column_name = 'unique_key'
+              AND tc.constraint_type = 'UNIQUE'
+            """
+        ).fetchone()
+        assert row is not None and row["constraint_type"] == "UNIQUE"
 
     def test_new_event_inserted(self, db):
         res = insert_events([make_event()])
@@ -81,7 +90,7 @@ class TestInsertEvents:
         second = insert_events([make_event(process_name="other.exe")])  # тот же unique_key
         assert first == {"inserted": 1, "deduped": 0}
         assert second == {"inserted": 0, "deduped": 1}
-        assert db.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM events").fetchone()["count"] == 1
 
     def test_mixed_batch(self, db):
         insert_events([make_event()])
@@ -160,7 +169,7 @@ class TestDetectAlertsRss:
         # прогоняем baseline через детектор, чтобы он тоже был "как в проде";
         # эти события ниже very_high_abs и без baseline не дают rss-алертов
         detect_alerts_for_ingested_events(baseline)
-        before = db.execute("SELECT COUNT(*) FROM alerts WHERE metric='rss'").fetchone()[0]
+        before = db.execute("SELECT COUNT(*) FROM alerts WHERE metric='rss'").fetchone()["count"]
         assert before == 0
 
         anomaly = _anomaly_event(rss_bytes)
@@ -210,7 +219,7 @@ class TestDetectAlertsRss:
         # повторный прогон того же события: dedup_key уникален -> ничего не добавится
         again = detect_alerts_for_ingested_events([_anomaly_event(value)])
         assert again == 0
-        assert db.execute("SELECT COUNT(*) FROM alerts WHERE metric='rss' AND pid=9999").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM alerts WHERE metric='rss' AND pid=9999").fetchone()["count"] == 1
 
 
 class TestDetectAlertsWithoutBaseline:
@@ -220,7 +229,7 @@ class TestDetectAlertsWithoutBaseline:
         below = _anomaly_event(int(rule["very_high_abs"]))          # ровно порог: не строго больше
         insert_events([below])
         detect_alerts_for_ingested_events([below])
-        assert db.execute("SELECT COUNT(*) FROM alerts WHERE metric='rss'").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM alerts WHERE metric='rss'").fetchone()["count"] == 0
 
         above = make_event(
             pid=7777,
@@ -241,5 +250,5 @@ class TestDetectAlertsWithoutBaseline:
         insert_events([e])
         assert detect_alerts_for_ingested_events([e]) == 0
 
-    def test_empty_payload(self, db_path):
+    def test_empty_payload(self, db):
         assert detect_alerts_for_ingested_events([]) == 0

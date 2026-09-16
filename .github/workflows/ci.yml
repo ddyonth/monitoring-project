@@ -10,6 +10,23 @@ jobs:
   test:
     name: Tests (ubuntu, Python 3.11)
     runs-on: ubuntu-latest
+    services:
+      # Тесты гоняются против настоящего Postgres (та же мажорная версия и
+      # локаль, что в docker-compose.yml); conftest создаёт БД monitoring_test
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: monitoring
+          POSTGRES_PASSWORD: ci_password
+          POSTGRES_DB: monitoring
+          POSTGRES_INITDB_ARGS: "--locale=C.UTF-8"
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U monitoring -d monitoring"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
@@ -32,6 +49,8 @@ jobs:
         run: ruff check --output-format=github .
 
       - name: Run tests
+        env:
+          MONITORING_TEST_DATABASE_URL: postgresql://monitoring:ci_password@localhost:5432/monitoring_test
         run: python -m pytest server/tests -v
 
   build-windows-agent:
