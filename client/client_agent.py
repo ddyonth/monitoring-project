@@ -4,6 +4,7 @@ import json
 import time
 import sqlite3
 import socket
+import stat
 import getpass
 import argparse
 import hashlib
@@ -17,10 +18,34 @@ import psutil
 import requests
 # Config
 
-# Версия этого экземпляра агента. Единственный источник для сравнения с релизом
-# на сервере (config.json может переопределить только то, что агент СООБЩАЕТ
-# серверу, но не то, с чем он сравнивает релизы — иначе обновление зациклится).
-CLIENT_VERSION = "1.2"
+def _load_client_version() -> str:
+    """
+    Версия этого экземпляра агента — единственная база для сравнения с релизом
+    на сервере (config.json может переопределить только то, что агент СООБЩАЕТ
+    серверу, иначе обновление зациклится).
+
+    Источник — файл client/VERSION. В упакованный exe версия попадает на этапе
+    сборки: client_agent.spec генерирует модуль _version.py, который PyInstaller
+    вшивает в бинарник, поэтому в рантайме с диска ничего не читается
+    (в onefile __file__ указывает во временный _MEIPASS, см. CONFIG_CANDIDATES).
+    При запуске из исходников читается сам файл VERSION рядом с этим .py.
+    """
+    if getattr(sys, "frozen", False):
+        try:
+            from _version import CLIENT_VERSION as built  # сгенерирован spec-ом при сборке
+            return str(built).strip()
+        except Exception:
+            # exe собран без spec-а: версии нет, считаем её нулевой, чтобы
+            # первый же опубликованный релиз её заменил
+            return "0.0"
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION"), "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return "0.0"
+
+
+CLIENT_VERSION = _load_client_version()
 
 INGEST_SUFFIX = "/api/ingest"
 
@@ -804,16 +829,33 @@ def _remove_quietly(path: str) -> None:
 
 def apply_downloaded_release(exe_path: str, downloaded_path: str) -> None:
     """Текущий exe -> exe.old, скачанный -> на место текущего (атомарно через os.replace)."""
+    # Скачанный файл создан с правами по умолчанию (без бита исполнения на
+    # Linux) — переносим права текущего exe, иначе новую версию нельзя запустить.
+    try:
+        os.chmod(downloaded_path, stat.S_IMODE(os.stat(exe_path).st_mode))
+    except Exception as e:
+        _log_update(f"cannot copy file mode to {downloaded_path}: {e}")
     old_path = exe_path + OLD_SUFFIX
     _remove_quietly(old_path)
     os.replace(exe_path, old_path)
     os.replace(downloaded_path, exe_path)
 
 
+def _child_environment() -> Dict[str, str]:
+    """
+    Окружение для перезапускаемого exe без служебных переменных PyInstaller
+    (_PYI_ARCHIVE_FILE, _PYI_APPLICATION_HOME_DIR, _PYI_PARENT_PROCESS_LEVEL,
+    _MEIPASS2 и т.п.). Унаследовав их, новый onefile-exe использует временный
+    каталог родителя, который удаляется при выходе старого процесса, и гибнет.
+    """
+    return {k: v for k, v in os.environ.items() if not k.startswith("_PYI_") and k != "_MEIPASS2"}
+
+
 def relaunch(exe_path: str, argv: List[str]) -> None:
     """Запускает новый exe с теми же аргументами независимо от текущего процесса."""
     kwargs: Dict[str, Any] = {
         "cwd": os.path.dirname(exe_path) or None,
+        "env": _child_environment(),
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.DEVNULL,
         "stderr": subprocess.DEVNULL,

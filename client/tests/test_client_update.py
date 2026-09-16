@@ -23,6 +23,7 @@ from client_agent import (
     is_newer_version,
     load_config,
     parse_version,
+    relaunch,
     server_base_url,
 )
 
@@ -251,6 +252,14 @@ class TestFileOps:
         assert (tmp_path / "a.exe.old").read_bytes() == b"old"
         assert not new.exists()
 
+    @pytest.mark.skipif(os.name == "nt", reason="бит исполнения есть только на POSIX")
+    def test_apply_preserves_executable_bit(self, tmp_path):
+        exe = tmp_path / "a.exe"; exe.write_bytes(b"old"); exe.chmod(0o755)
+        new = tmp_path / "a.exe.download"; new.write_bytes(b"new"); new.chmod(0o644)
+        apply_downloaded_release(str(exe), str(new))
+        assert os.access(str(exe), os.X_OK)
+        assert oct(exe.stat().st_mode & 0o777) == "0o755"
+
     def test_apply_overwrites_stale_old(self, tmp_path):
         exe = tmp_path / "a.exe"; exe.write_bytes(b"old")
         (tmp_path / "a.exe.old").write_bytes(b"stale")
@@ -265,3 +274,44 @@ class TestFileOps:
         assert not (tmp_path / "a.exe.old").exists()
         cleanup_old_executable(str(exe))   # повторно — без ошибок
         cleanup_old_executable(None)
+
+
+# ------------------------------------------------------------- client/VERSION
+
+class TestVersionFile:
+    def test_version_file_is_the_source_when_running_from_source(self):
+        version_file = os.path.join(os.path.dirname(client_agent.__file__), "VERSION")
+        with open(version_file, encoding="utf-8") as f:
+            assert CLIENT_VERSION == f.read().strip()
+
+    def test_version_file_format(self):
+        assert parse_version(CLIENT_VERSION) is not None
+        assert len(parse_version(CLIENT_VERSION)) >= 2
+
+
+# ------------------------------------------------------------- relaunch
+
+class TestRelaunch:
+    @pytest.mark.skipif(os.name == "nt", reason="shell-скрипт вместо exe — только POSIX")
+    def test_child_gets_args_and_no_pyinstaller_env(self, tmp_path, monkeypatch):
+        import time
+        out = tmp_path / "child.txt"
+        script = tmp_path / "fake_agent.sh"
+        script.write_text(f'#!/bin/sh\necho "ARGS:$*" > "{out}"\nenv >> "{out}"\n')
+        script.chmod(0o755)
+        # так выглядит окружение внутри onefile-exe PyInstaller
+        monkeypatch.setenv("_PYI_APPLICATION_HOME_DIR", "/tmp/_MEIfake")
+        monkeypatch.setenv("_PYI_ARCHIVE_FILE", "/tmp/fake")
+        monkeypatch.setenv("_MEIPASS2", "/tmp/_MEIfake")
+        monkeypatch.setenv("MONITORING_CLIENT_UPDATE_KEY", "KEEP_ME")
+
+        relaunch(str(script), ["--apply-update-now"])
+        for _ in range(50):
+            if out.exists() and "MONITORING_CLIENT_UPDATE_KEY" in out.read_text():
+                break
+            time.sleep(0.1)
+        text = out.read_text()
+        assert text.startswith("ARGS:--apply-update-now")
+        assert "MONITORING_CLIENT_UPDATE_KEY=KEEP_ME" in text
+        assert "_PYI_" not in text
+        assert "_MEIPASS2" not in text
