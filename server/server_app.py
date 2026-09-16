@@ -1474,14 +1474,16 @@ def _count_prior_chain_sessions(
               end_time,
               COALESCE(NULLIF(sha256, ''), 'path:' || lower(COALESCE(exe_path, '')), 'name:' || lower(process_name)) AS child_key
           FROM (
-            -- одна строка на сессию (в SQLite это делал GROUP BY с "голыми" колонками);
-            -- берём последний сэмпл сессии
+            -- одна строка на сессию. В SQLite это делал GROUP BY с "голыми"
+            -- колонками: формально произвольная строка группы, фактически (проверено
+            -- на индексе idx_events_session) — САМЫЙ РАННИЙ сэмпл сессии. Сохраняем
+            -- именно это поведение: ORDER BY sample_time ASC.
             SELECT DISTINCT ON (machine_name, pid, start_time) *
             FROM events
             WHERE machine_name=%s
               AND sample_time < %s
               AND NOT (machine_name=%s AND COALESCE(pid, 0)=%s AND start_time=%s)
-            ORDER BY machine_name, pid, start_time, sample_time DESC
+            ORDER BY machine_name, pid, start_time, sample_time ASC
           ) AS last_samples
         ),
         parent_candidates AS (
