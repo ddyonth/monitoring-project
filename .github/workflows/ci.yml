@@ -87,3 +87,85 @@ jobs:
           name: client_agent-windows
           path: client/dist/client_agent.exe
           if-no-files-found: error
+
+  # Определяет, менялось ли что-то в client/** в этом push (только push в master).
+  # Выполняется на GitHub-раннере, чтобы self-hosted раннер не занимался пустыми прогонами.
+  detect-client-changes:
+    name: Detect client changes
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    outputs:
+      client_changed: ${{ steps.diff.outputs.client_changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: diff
+        shell: bash
+        run: |
+          before="${{ github.event.before }}"
+          if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$before" 2>/dev/null; then
+            echo "no usable base commit, treating client as changed"
+            echo "client_changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git diff --quiet "$before" "${{ github.sha }}" -- client/; then
+            echo "client_changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "client_changed=true" >> "$GITHUB_OUTPUT"
+          fi
+          git diff --stat "$before" "${{ github.sha }}" -- client/ || true
+
+  # Публикация собранного агента на сервер мониторинга с self-hosted раннера.
+  #
+  # БЕЗОПАСНОСТЬ (репозиторий публичный, раннер стоит на личной машине):
+  #  - запускается ТОЛЬКО на push в master этого репозитория с изменениями в client/**;
+  #  - никогда на pull_request (условие ниже) и никогда по workflow_dispatch
+  #    (такого триггера у workflow нет вообще);
+  #  - нужен раннер с меткой monitoring-publisher, чтобы другие джобы на него не попадали.
+  # Условие в файле защищает от случайного запуска; от злонамеренного PR из форка
+  # (который может привезти свой ci.yml) защищает только настройка репозитория
+  # Settings -> Actions -> "Require approval for all external contributors".
+  publish-client-release:
+    name: Publish client release (self-hosted)
+    needs: [test, build-windows-agent, detect-client-changes]
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/master' &&
+      github.repository == 'ddyonth/monitoring-project' &&
+      needs.detect-client-changes.outputs.client_changed == 'true'
+    runs-on: [self-hosted, linux, monitoring-publisher]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Тот же артефакт, что собрала джоба build-windows-agent в этом прогоне
+      - uses: actions/download-artifact@v4
+        with:
+          name: client_agent-windows
+          path: release
+
+      # Версия — из client/VERSION того же коммита, из которого собран exe
+      - name: Read client version
+        id: version
+        shell: bash
+        run: |
+          version="$(tr -d '[:space:]' < client/VERSION)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "client version: $version"
+          test -s release/client_agent.exe
+          sha256sum release/client_agent.exe
+
+      - name: Publish to monitoring server
+        shell: bash
+        env:
+          MONITORING_SERVER_URL: ${{ secrets.MONITORING_SERVER_URL }}
+          MONITORING_API_KEY: ${{ secrets.MONITORING_API_KEY }}
+        run: |
+          test -n "$MONITORING_SERVER_URL" || { echo "secret MONITORING_SERVER_URL is not set"; exit 1; }
+          test -n "$MONITORING_API_KEY" || { echo "secret MONITORING_API_KEY is not set"; exit 1; }
+          curl -sS --fail-with-body --max-time 300 \
+            -X POST \
+            -H "X-API-Key: $MONITORING_API_KEY" \
+            -F "version=${{ steps.version.outputs.version }}" \
+            -F "file=@release/client_agent.exe" \
+            "${MONITORING_SERVER_URL%/}/api/client-release"

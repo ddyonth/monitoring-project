@@ -133,6 +133,66 @@ Get-ScheduledTask -TaskName "MonitoringAgent-*" | Format-Table TaskName, State
 Переменные из `setx` попадают в новые процессы, поэтому после них перезапустите
 агент (или дождитесь сторожа).
 
+## CI/CD: автопубликация релиза агента
+
+В `.github/workflows/ci.yml` джоба `publish-client-release` берёт
+`client_agent.exe`, собранный джобой `build-windows-agent` в том же прогоне,
+читает версию из `client/VERSION` и публикует релиз на сервер запросом
+`POST /api/client-release`. Агенты подхватят его при следующей проверке.
+
+Условия запуска (заданы в файле, не в настройках GitHub):
+
+- только событие `push` в ветку `master` этого репозитория;
+- только если в этом push менялось что-то в `client/**` (джоба
+  `detect-client-changes`);
+- после зелёных `test` и `build-windows-agent`;
+- никогда на `pull_request`; триггера `workflow_dispatch` у workflow нет.
+
+Джоба выполняется на self-hosted раннере с меткой `monitoring-publisher`,
+потому что сервер мониторинга сейчас доступен только с этой машины.
+
+Секреты репозитория (Settings → Secrets and variables → Actions):
+
+| Секрет | Значение |
+|---|---|
+| `MONITORING_SERVER_URL` | базовый адрес сервера, сейчас `http://localhost:8000`, для VPS — его адрес |
+| `MONITORING_API_KEY` | `api_key` сервера (тот же, что у compose-стека) |
+
+Поток релиза: поменять `client/VERSION` (и код агента) → PR → squash-merge в
+`master` → CI собирает exe → публикация → агенты обновляются в течение
+одного интервала опроса. Если `client/**` менялся, а `VERSION` — нет, на сервер
+уйдёт новая сборка с той же версией: агенты с этой версией её не скачают
+(обновление только на строго новую версию).
+
+Self-hosted раннер в WSL2 (регистрируется вручную, токен выдаёт GitHub в
+Settings → Actions → Runners → New self-hosted runner → Linux x64):
+
+```bash
+mkdir -p ~/actions-runner && cd ~/actions-runner
+# ссылку на архив и одноразовый токен возьмите со страницы New self-hosted runner
+curl -o actions-runner-linux-x64.tar.gz -L <url_из_GitHub>
+tar xzf actions-runner-linux-x64.tar.gz
+./config.sh --url https://github.com/ddyonth/monitoring-project --token <ТОКЕН> \
+  --name wsl-publisher --labels monitoring-publisher --unattended
+./run.sh                      # интерактивно, пока открыт терминал
+# либо как systemd-сервис (WSL2 с systemd):
+sudo ./svc.sh install $USER && sudo ./svc.sh start
+```
+
+Раннер должен видеть сервер по `MONITORING_SERVER_URL`: при `localhost:8000`
+compose-стек в `/opt/monitoring` должен быть запущен на той же машине.
+
+Отключить: `sudo ./svc.sh stop` (или закрыть `run.sh`); разрегистрировать
+навсегда: `./config.sh remove --token <ТОКЕН_УДАЛЕНИЯ>` (токен со страницы
+раннера в GitHub) и удалить каталог. Пока раннер выключен, джоба публикации
+будет висеть в очереди до его появления, остальные джобы CI это не блокирует.
+
+Обязательная настройка для публичного репозитория с self-hosted раннером:
+Settings → Actions → General → Fork pull request workflows from outside
+collaborators → **Require approval for all external contributors**. PR из форка
+исполняет `ci.yml` из форка, и условие `if` в файле само по себе от такого PR
+не защищает.
+
 ## Секреты
 
 Ключи `api_key` (сервер и агент) и `client_update_key` (сервер) в файлах
