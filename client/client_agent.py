@@ -40,6 +40,10 @@ def load_config() -> Dict[str, Any]:
                 break
         except Exception:
             pass
+    # Secret from environment takes priority over config.json
+    env_api_key = os.environ.get("MONITORING_API_KEY")
+    if env_api_key is not None and env_api_key.strip():
+        cfg["api_key"] = env_api_key
     return cfg
 
 

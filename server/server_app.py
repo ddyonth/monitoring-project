@@ -28,6 +28,12 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.j
 API_KEY_DEFAULT = "CHANGE_ME_LOCAL_KEY"
 CLIENT_UPDATE_KEY_DEFAULT = "CHANGE_ME_CLIENT_KEY"
 
+# Secrets: environment variables take priority over config.json for these keys
+CFG_ENV_OVERRIDES = {
+    "api_key": "MONITORING_API_KEY",
+    "client_update_key": "MONITORING_CLIENT_UPDATE_KEY",
+}
+
 # analytics defaults
 PROFILE_WINDOW_DAYS_DEFAULT = 14
 RARE_COUNT_THRESHOLD_DEFAULT = 3
@@ -66,6 +72,11 @@ def _get_cfg() -> Dict[str, Any]:
 
 
 def _cfg_get(key: str, default: Any) -> Any:
+    env_name = CFG_ENV_OVERRIDES.get(key)
+    if env_name:
+        env_val = os.environ.get(env_name)
+        if env_val is not None and env_val.strip():
+            return env_val
     cfg = _get_cfg()
     v = cfg.get(key, default)
     return v

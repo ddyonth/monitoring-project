@@ -61,6 +61,36 @@ python server/server_app.py
 python client/client_agent.py
 ```
 
+## Секреты
+
+Ключи `api_key` (сервер и агент) и `client_update_key` (сервер) в файлах
+`server/config.json` и `client/config.json` — это шаблоны с placeholder
+`CHANGE_ME_LOCAL_KEY`, они закоммичены в репозиторий и нужны только для того,
+чтобы приложение стартовало локально без настройки.
+
+Для реального использования ключи задаются через переменные окружения, а не
+правкой закоммиченного `config.json`:
+
+| Переменная | Кто читает | Что переопределяет |
+|---|---|---|
+| `MONITORING_API_KEY` | сервер и агент | `api_key` |
+| `MONITORING_CLIENT_UPDATE_KEY` | сервер | `client_update_key` |
+
+Приоритет: если переменная задана и не пустая, берётся она; иначе значение из
+`config.json`; если и там нет — встроенное значение по умолчанию из кода.
+Пример имён переменных — в `.env.example` (файл `.env` в `.gitignore`).
+
+Пример запуска сервера с ключом из окружения:
+
+```powershell
+$env:MONITORING_API_KEY = "секрет"
+python server/server_app.py
+```
+
+```bash
+MONITORING_API_KEY=секрет python server/server_app.py
+```
+
 ## Примечания
 
 - Основной сценарий использования проекта — запуск клиентской и серверной частей в виде `.exe`.
