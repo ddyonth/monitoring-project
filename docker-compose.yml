@@ -1,0 +1,31 @@
+services:
+  server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+      target: base
+    image: monitoring-server:local
+    ports:
+      - "8000:8000"
+    environment:
+      # Секреты берутся из окружения хоста (или из .env рядом с этим файлом,
+      # см. .env.example). Без MONITORING_API_KEY compose откажется стартовать.
+      MONITORING_API_KEY: ${MONITORING_API_KEY:?set MONITORING_API_KEY in host environment or .env}
+      MONITORING_CLIENT_UPDATE_KEY: ${MONITORING_CLIENT_UPDATE_KEY:-}
+    volumes:
+      # SQLite-файл живёт в named volume, переживает пересоздание контейнера
+      - server_data:/app/data
+    restart: unless-stopped
+
+  # Прогон тестов внутри контейнера: docker compose run --rm tests
+  tests:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+      target: test
+    image: monitoring-server:test
+    profiles: ["test"]
+    command: ["python", "-m", "pytest", "tests", "-v"]
+
+volumes:
+  server_data:

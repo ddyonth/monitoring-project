@@ -91,6 +91,27 @@ python server/server_app.py
 MONITORING_API_KEY=секрет python server/server_app.py
 ```
 
+## Запуск сервера в Docker
+
+Образ описан в `server/Dockerfile` (python:3.11-slim), контекст сборки — корень
+репозитория. `docker-compose.yml` поднимает сервис `server` на порту 8000; файл
+SQLite хранится в named volume `server_data` и переживает пересоздание контейнера.
+
+Секрет передаётся из окружения хоста (или из `.env` рядом с compose-файлом,
+см. `.env.example`); без `MONITORING_API_KEY` compose не стартует:
+
+```bash
+export MONITORING_API_KEY=секрет
+docker compose up -d --build
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8000/
+```
+
+Тесты внутри того же контейнерного окружения (стадия `test` в Dockerfile):
+
+```bash
+docker compose run --rm tests
+```
+
 ## Деплой сервера на Linux (Ansible)
 
 Плейбук в `deploy/ansible/` разворачивает сервер как systemd-сервис
