@@ -1,0 +1,10 @@
+---
+- name: Deploy monitoring server
+  hosts: app_servers
+  become: true
+  vars_files:
+    # Секреты (зашифрованы ansible-vault, файл не в репозитории):
+    # см. group_vars/local/vault.yml.example
+    - group_vars/local/vault.yml
+  roles:
+    - monitoring_server

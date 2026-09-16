@@ -1,0 +1,85 @@
+---
+# Только OS-generic модули (apt / user / file / copy / template / pip / systemd),
+# чтобы роль работала на любом apt-based Debian/Ubuntu-хосте.
+
+- name: Install system packages (python + venv)
+  ansible.builtin.apt:
+    name: "{{ python_apt_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Create service user
+  ansible.builtin.user:
+    name: "{{ monitoring_user }}"
+    system: true
+    shell: /usr/sbin/nologin
+    home: "{{ deploy_dir }}"
+    create_home: false
+
+- name: Create deploy directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ monitoring_user }}"
+    group: "{{ monitoring_user }}"
+    mode: "0755"
+  loop:
+    - "{{ deploy_dir }}"
+    - "{{ deploy_dir }}/server"
+
+- name: Copy requirements.txt
+  ansible.builtin.copy:
+    src: "{{ monitoring_src_dir }}/requirements.txt"
+    dest: "{{ deploy_dir }}/requirements.txt"
+    mode: "0644"
+
+- name: Create venv and install dependencies
+  ansible.builtin.pip:
+    requirements: "{{ deploy_dir }}/requirements.txt"
+    virtualenv: "{{ deploy_dir }}/venv"
+    virtualenv_command: "{{ python_bin }} -m venv"
+  notify: Restart monitoring server
+
+# Копируем именно код server/: server_app.py, templates/, static/.
+# server.db (данные), tests/ и __pycache__ на целевой хост не нужны,
+# config.json рендерится отдельно из шаблона.
+- name: Copy server code
+  ansible.builtin.copy:
+    src: "{{ monitoring_src_dir }}/server/{{ item }}"
+    dest: "{{ deploy_dir }}/server/{{ item }}"
+    owner: "{{ monitoring_user }}"
+    group: "{{ monitoring_user }}"
+    mode: "0644"
+    directory_mode: "0755"
+  loop:
+    - server_app.py
+    - templates/
+    - static/
+  notify: Restart monitoring server
+
+- name: Render config.json (without secrets)
+  ansible.builtin.template:
+    src: config.json.j2
+    dest: "{{ deploy_dir }}/server/config.json"
+    owner: "{{ monitoring_user }}"
+    group: "{{ monitoring_user }}"
+    mode: "0644"
+  notify: Restart monitoring server
+
+# Секрет передаётся сервису только через Environment= в unit-файле.
+- name: Install systemd unit
+  ansible.builtin.template:
+    src: monitoring-server.service.j2
+    dest: "/etc/systemd/system/{{ monitoring_service_name }}.service"
+    owner: root
+    group: root
+    mode: "0640"
+  notify: Restart monitoring server
+
+- name: Enable and start service
+  ansible.builtin.systemd_service:
+    name: "{{ monitoring_service_name }}"
+    daemon_reload: true
+    enabled: true
+    state: started

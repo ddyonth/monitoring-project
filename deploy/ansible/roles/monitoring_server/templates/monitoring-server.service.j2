@@ -1,0 +1,23 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Monitoring server (FastAPI)
+After=network.target
+
+[Service]
+Type=simple
+User={{ monitoring_user }}
+Group={{ monitoring_user }}
+# В коде RES_DIR/DB_PATH/CONFIG_PATH резолвятся относительно __file__,
+# но рабочий каталог задаём явно, чтобы относительные пути (db_path и т.п.)
+# указывали в каталог сервера.
+WorkingDirectory={{ deploy_dir }}/server
+Environment=MONITORING_API_KEY={{ monitoring_api_key }}
+{% if monitoring_client_update_key is defined and monitoring_client_update_key %}
+Environment=MONITORING_CLIENT_UPDATE_KEY={{ monitoring_client_update_key }}
+{% endif %}
+ExecStart={{ deploy_dir }}/venv/bin/python {{ deploy_dir }}/server/server_app.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

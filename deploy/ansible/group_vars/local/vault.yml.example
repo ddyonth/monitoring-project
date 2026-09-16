@@ -1,0 +1,15 @@
+---
+# Пример структуры секретов. Реальный файл vault.yml в .gitignore и должен
+# быть зашифрован ansible-vault:
+#
+#   cp deploy/ansible/group_vars/local/vault.yml.example deploy/ansible/group_vars/local/vault.yml
+#   (заполнить значения)
+#   ansible-vault encrypt deploy/ansible/group_vars/local/vault.yml
+#
+# Файл подключается в playbook.yml через vars_files.
+
+# Ключ API для приёма событий (должен совпадать с MONITORING_API_KEY у агентов)
+monitoring_api_key: "CHANGE_ME"
+
+# Ключ для раздачи обновлений клиента (эндпоинты /api/client-release, /api/download/client-agent)
+monitoring_client_update_key: "CHANGE_ME"

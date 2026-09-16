@@ -40,3 +40,6 @@ Thumbs.db
 # Config (если появятся секреты)
 .env
 !README.md
+
+# Ansible vault с реальными секретами
+deploy/ansible/group_vars/local/vault.yml

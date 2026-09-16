@@ -91,6 +91,41 @@ python server/server_app.py
 MONITORING_API_KEY=секрет python server/server_app.py
 ```
 
+## Деплой сервера на Linux (Ansible)
+
+Плейбук в `deploy/ansible/` разворачивает сервер как systemd-сервис
+`monitoring-server` в `/opt/monitoring` (venv, код `server/`, `config.json`
+без секретов, unit-файл с `WorkingDirectory` и `Environment=MONITORING_API_KEY`).
+Control node — только Linux (например, WSL2 с Ubuntu); цель — любой
+apt-based хост (Debian/Ubuntu). Сейчас в инвентаре `localhost`, для VPS см.
+комментарий в `deploy/ansible/inventory/hosts.ini`.
+
+1. Создать файл секретов из примера и зашифровать его (в репозиторий он не
+   попадает, путь есть в `.gitignore`):
+
+```bash
+cp deploy/ansible/group_vars/local/vault.yml.example deploy/ansible/group_vars/local/vault.yml
+# отредактировать значения monitoring_api_key / monitoring_client_update_key
+ansible-vault encrypt deploy/ansible/group_vars/local/vault.yml
+```
+
+2. Запустить плейбук (нужен sudo на целевом хосте, поэтому `--ask-become-pass`):
+
+```bash
+ansible-playbook -i deploy/ansible/inventory/hosts.ini deploy/ansible/playbook.yml --ask-vault-pass --ask-become-pass
+```
+
+3. Проверить, что сервис жив (эндпоинта `/health` нет, дашборд отдаётся без ключа):
+
+```bash
+systemctl status monitoring-server
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8000/
+```
+
+Повторный запуск плейбука без изменений в коде и переменных не должен
+ничего менять (идемпотентность); при изменении кода/конфига сервис
+перезапускается handler-ом.
+
 ## Примечания
 
 - Основной сценарий использования проекта — запуск клиентской и серверной частей в виде `.exe`.
