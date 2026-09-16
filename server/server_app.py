@@ -1,11 +1,14 @@
 import json
 import os
-import sqlite3
 import sys
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+import psycopg
+from psycopg import ClientCursor
+from psycopg.errors import UniqueViolation
+from psycopg.rows import dict_row
 from fastapi import Body, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -21,7 +24,6 @@ def resource_dir() -> str:
 
 
 RES_DIR = resource_dir()
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server.db")
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
 # API keys (can be overridden in config.json)
@@ -32,6 +34,7 @@ CLIENT_UPDATE_KEY_DEFAULT = "CHANGE_ME_CLIENT_KEY"
 CFG_ENV_OVERRIDES = {
     "api_key": "MONITORING_API_KEY",
     "client_update_key": "MONITORING_CLIENT_UPDATE_KEY",
+    "database_url": "MONITORING_DATABASE_URL",
 }
 
 # analytics defaults
@@ -105,46 +108,68 @@ def _local_hour_from_iso(s: Optional[str]) -> Optional[int]:
     except Exception:
         return int(dt.hour)
 
-def db_connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+# Row/cursor types: строки читаются как dict (r["column"]), как раньше DbRow
+DbRow = Dict[str, Any]
+DbCursor = psycopg.Cursor
+
+
+def _database_url() -> str:
+    url = str(_cfg_get("database_url", "") or "").strip()
+    if not url:
+        raise RuntimeError(
+            "Database is not configured: set MONITORING_DATABASE_URL "
+            "(postgresql://user:password@host:5432/dbname)"
+        )
+    return url
+
+
+def db_connect() -> psycopg.Connection:
+    # Соединение на каждый вызов, как раньше с SQLite (без пула).
+    # ClientCursor подставляет параметры на клиенте (как psycopg2) — иначе
+    # Postgres не может вывести тип параметра в выражениях вроде (%s = '').
+    return psycopg.connect(_database_url(), row_factory=dict_row, cursor_factory=ClientCursor)
 
 
 def ensure_schema() -> None:
     conn = db_connect()
     cur = conn.cursor()
 
+    # NB: все даты/время (start_time, sample_time, end_time, received_at, created_at,
+    # last_seen, updated_at, ack_at, closed_at, boot_time, bucket_hour) намеренно
+    # остаются TEXT в ISO-формате: код сравнивает их как строки.
+    # Счётчики байт — BIGINT (в SQLite INTEGER был 64-битным).
+
     # --- main append-only events table (one row per sample)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BIGSERIAL PRIMARY KEY,
             machine_name TEXT NOT NULL,
             user_name TEXT,
             process_name TEXT NOT NULL,
             pid INTEGER,
             ppid INTEGER,
             exe_path TEXT,
+            sha256 TEXT,
 
             start_time TEXT NOT NULL,
             sample_time TEXT NOT NULL,
             end_time TEXT,
-            duration_seconds INTEGER NOT NULL,
+            duration_seconds BIGINT NOT NULL,
 
-            cpu_user_time_s REAL,
-            cpu_system_time_s REAL,
-            rss_bytes INTEGER,
-            io_read_bytes INTEGER,
-            io_write_bytes INTEGER,
-            io_read_count INTEGER,
-            io_write_count INTEGER,
+            cpu_user_time_s DOUBLE PRECISION,
+            cpu_system_time_s DOUBLE PRECISION,
+            rss_bytes BIGINT,
+            io_read_bytes BIGINT,
+            io_write_bytes BIGINT,
+            io_read_count BIGINT,
+            io_write_count BIGINT,
             net_active INTEGER,
             net_conn_count INTEGER,
 
             boot_time TEXT,
             os_info TEXT,
-            current_user TEXT,
+            "current_user" TEXT,
             client_version TEXT,
 
             unique_key TEXT NOT NULL UNIQUE,
@@ -154,19 +179,11 @@ def ensure_schema() -> None:
     )
 
     # --- MIGRATIONS for existing DBs (backward-compatible)
-    cur.execute("PRAGMA table_info(events);")
-    cols = {row[1] for row in cur.fetchall()}
-
-    if "sha256" not in cols:
-        cur.execute("ALTER TABLE events ADD COLUMN sha256 TEXT;")
-    if "end_time" not in cols:
-        cur.execute("ALTER TABLE events ADD COLUMN end_time TEXT;")
-    if "ppid" not in cols:
-        cur.execute("ALTER TABLE events ADD COLUMN ppid INTEGER;")
-    if "net_active" not in cols:
-        cur.execute("ALTER TABLE events ADD COLUMN net_active INTEGER;")
-    if "net_conn_count" not in cols:
-        cur.execute("ALTER TABLE events ADD COLUMN net_conn_count INTEGER;")
+    cur.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS sha256 TEXT;")
+    cur.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS end_time TEXT;")
+    cur.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS ppid INTEGER;")
+    cur.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS net_active INTEGER;")
+    cur.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS net_conn_count INTEGER;")
 
     cur.execute("CREATE INDEX IF NOT EXISTS idx_events_session ON events(machine_name, pid, start_time, sample_time);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_events_sha ON events(sha256);")
@@ -178,29 +195,19 @@ def ensure_schema() -> None:
             machine_name TEXT PRIMARY KEY,
             boot_time TEXT,
             os_info TEXT,
-            current_user TEXT,
+            "current_user" TEXT,
             client_version TEXT,
             last_seen TEXT,
             updated_at TEXT
         );
         """
     )
-
-    cur.execute("PRAGMA table_info(machine_state);")
-    ms_cols = {row[1] for row in cur.fetchall()}
-
-    if "updated_at" not in ms_cols:
-        cur.execute("ALTER TABLE machine_state ADD COLUMN updated_at TEXT;")
-    if "last_seen" not in ms_cols:
-        cur.execute("ALTER TABLE machine_state ADD COLUMN last_seen TEXT;")
-    if "client_version" not in ms_cols:
-        cur.execute("ALTER TABLE machine_state ADD COLUMN client_version TEXT;")
-    if "current_user" not in ms_cols:
-        cur.execute("ALTER TABLE machine_state ADD COLUMN current_user TEXT;")
-    if "os_info" not in ms_cols:
-        cur.execute("ALTER TABLE machine_state ADD COLUMN os_info TEXT;")
-    if "boot_time" not in ms_cols:
-        cur.execute("ALTER TABLE machine_state ADD COLUMN boot_time TEXT;")
+    cur.execute("ALTER TABLE machine_state ADD COLUMN IF NOT EXISTS updated_at TEXT;")
+    cur.execute("ALTER TABLE machine_state ADD COLUMN IF NOT EXISTS last_seen TEXT;")
+    cur.execute("ALTER TABLE machine_state ADD COLUMN IF NOT EXISTS client_version TEXT;")
+    cur.execute('ALTER TABLE machine_state ADD COLUMN IF NOT EXISTS "current_user" TEXT;')
+    cur.execute("ALTER TABLE machine_state ADD COLUMN IF NOT EXISTS os_info TEXT;")
+    cur.execute("ALTER TABLE machine_state ADD COLUMN IF NOT EXISTS boot_time TEXT;")
 
     # --- aliases
     cur.execute(
@@ -236,18 +243,13 @@ def ensure_schema() -> None:
         );
         """
     )
-
-    cur.execute("PRAGMA table_info(chain_catalog);")
-    cc_cols = {row[1] for row in cur.fetchall()}
-    if "updated_at" not in cc_cols:
-        cur.execute("ALTER TABLE chain_catalog ADD COLUMN updated_at TEXT;")
-
+    cur.execute("ALTER TABLE chain_catalog ADD COLUMN IF NOT EXISTS updated_at TEXT;")
 
     # --- roles (minimal)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS roles (
-            role_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            role_id BIGSERIAL PRIMARY KEY,
             role_name TEXT NOT NULL UNIQUE,
             description TEXT
         );
@@ -257,7 +259,7 @@ def ensure_schema() -> None:
         """
         CREATE TABLE IF NOT EXISTS machine_roles (
             machine_name TEXT PRIMARY KEY,
-            role_id INTEGER,
+            role_id BIGINT,
             updated_at TEXT,
             FOREIGN KEY(role_id) REFERENCES roles(role_id)
         );
@@ -266,7 +268,7 @@ def ensure_schema() -> None:
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS role_profiles (
-            role_id INTEGER PRIMARY KEY,
+            role_id BIGINT PRIMARY KEY,
             allowed_hashes_json TEXT,
             updated_at TEXT,
             FOREIGN KEY(role_id) REFERENCES roles(role_id)
@@ -276,7 +278,7 @@ def ensure_schema() -> None:
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS role_allowed_process_types (
-            role_id INTEGER NOT NULL,
+            role_id BIGINT NOT NULL,
             process_type TEXT NOT NULL,
             updated_at TEXT,
             PRIMARY KEY(role_id, process_type),
@@ -289,7 +291,7 @@ def ensure_schema() -> None:
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS alerts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BIGSERIAL PRIMARY KEY,
 
             created_at TEXT NOT NULL,
             sample_time TEXT NOT NULL,
@@ -312,9 +314,9 @@ def ensure_schema() -> None:
             chain_key TEXT,
 
             metric TEXT NOT NULL,               -- cpu_delta | io_delta | rss | net_conn_count | rarity | chain_rarity | time_anomaly
-            value REAL,
-            baseline REAL,
-            score REAL,
+            value DOUBLE PRECISION,
+            baseline DOUBLE PRECISION,
+            score DOUBLE PRECISION,
             severity TEXT NOT NULL,
             reason TEXT NOT NULL,
 
@@ -328,18 +330,11 @@ def ensure_schema() -> None:
         );
         """
     )
-    cur.execute("PRAGMA table_info(alerts);")
-    alert_cols = {row[1] for row in cur.fetchall()}
-    if "entity_type" not in alert_cols:
-        cur.execute("ALTER TABLE alerts ADD COLUMN entity_type TEXT;")
-    if "parent_process_name" not in alert_cols:
-        cur.execute("ALTER TABLE alerts ADD COLUMN parent_process_name TEXT;")
-    if "parent_sha256" not in alert_cols:
-        cur.execute("ALTER TABLE alerts ADD COLUMN parent_sha256 TEXT;")
-    if "parent_exe_path" not in alert_cols:
-        cur.execute("ALTER TABLE alerts ADD COLUMN parent_exe_path TEXT;")
-    if "chain_key" not in alert_cols:
-        cur.execute("ALTER TABLE alerts ADD COLUMN chain_key TEXT;")
+    cur.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS entity_type TEXT;")
+    cur.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS parent_process_name TEXT;")
+    cur.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS parent_sha256 TEXT;")
+    cur.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS parent_exe_path TEXT;")
+    cur.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS chain_key TEXT;")
 
     # indexes for speed
     cur.execute("CREATE INDEX IF NOT EXISTS idx_alerts_created_at ON alerts(created_at);")
@@ -377,14 +372,15 @@ def upsert_machine_state(machine: str, info: Dict[str, Optional[str]], now: str)
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO machine_state(machine_name, boot_time, os_info, current_user, client_version, last_seen, updated_at)
-        VALUES(?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO machine_state(machine_name, boot_time, os_info, "current_user", client_version, last_seen, updated_at)
+        VALUES(%s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT(machine_name) DO UPDATE SET
             boot_time=COALESCE(excluded.boot_time, machine_state.boot_time),
             os_info=COALESCE(excluded.os_info, machine_state.os_info),
-            current_user=COALESCE(excluded.current_user, machine_state.current_user),
+            "current_user"=COALESCE(excluded."current_user", machine_state."current_user"),
             client_version=COALESCE(excluded.client_version, machine_state.client_version),
-            last_seen=MAX(COALESCE(excluded.last_seen, machine_state.last_seen), machine_state.last_seen),
+            last_seen=(CASE WHEN machine_state.last_seen IS NULL THEN NULL
+                       ELSE GREATEST(COALESCE(excluded.last_seen, machine_state.last_seen), machine_state.last_seen) END),
             updated_at=excluded.updated_at
         """,
         (
@@ -430,17 +426,21 @@ def insert_events(events: List[Dict[str, Any]]) -> Dict[str, int]:
         }
 
         try:
-            cur.execute(
-                """
+            # savepoint на каждую строку: в Postgres ошибка (дубликат unique_key)
+            # переводит транзакцию в aborted-состояние, откат к savepoint
+            # позволяет продолжить вставку остальных событий пакета
+            with conn.transaction():
+                cur.execute(
+                    """
                 INSERT INTO events(
                     machine_name, user_name, process_name, pid, ppid, exe_path, sha256,
                     start_time, sample_time, end_time, duration_seconds,
                     cpu_user_time_s, cpu_system_time_s, rss_bytes,
                     io_read_bytes, io_write_bytes, io_read_count, io_write_count,
                     net_active, net_conn_count,
-                    boot_time, os_info, current_user, client_version,
+                    boot_time, os_info, "current_user", client_version,
                     unique_key, received_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     e["machine_name"],
@@ -470,9 +470,9 @@ def insert_events(events: List[Dict[str, Any]]) -> Dict[str, int]:
                     e["unique_key"],
                     now,
                 ),
-            )
+                )
             inserted += 1
-        except sqlite3.IntegrityError:
+        except UniqueViolation:
             deduped += 1
         except Exception:
             deduped += 1
@@ -538,19 +538,19 @@ def ingest(payload: List[Dict[str, Any]] = Body(...), x_api_key: Optional[str] =
 
     return {"ok": True, **res, "alerts_inserted": int(alerts_inserted)}
 
-def _latest_samples_by_session(cur: sqlite3.Cursor, machine: str, since_iso: str) -> List[sqlite3.Row]:
+def _latest_samples_by_session(cur: DbCursor, machine: str, since_iso: str) -> List[DbRow]:
     cur.execute(
         """
         WITH latest AS (SELECT pid, start_time, MAX(sample_time) AS max_sample
                         FROM events
-                        WHERE machine_name = ?
-                          AND sample_time >= ?
+                        WHERE machine_name = %s
+                          AND sample_time >= %s
                         GROUP BY pid, start_time),
              prev AS (SELECT e.pid, e.start_time, MAX(e.sample_time) AS prev_sample
                       FROM events e
                                JOIN latest l
-                                    ON e.pid IS l.pid AND e.start_time = l.start_time
-                      WHERE e.machine_name = ?
+                                    ON e.pid IS NOT DISTINCT FROM l.pid AND e.start_time = l.start_time
+                      WHERE e.machine_name = %s
                         AND e.sample_time < l.max_sample
                       GROUP BY e.pid, e.start_time)
         SELECT e.*,
@@ -558,40 +558,52 @@ def _latest_samples_by_session(cur: sqlite3.Cursor, machine: str, since_iso: str
                (SELECT cpu_user_time_s
                 FROM events e2
                 WHERE e2.machine_name = e.machine_name
-                  AND e2.pid IS e.pid
+                  AND e2.pid IS NOT DISTINCT FROM e.pid
                   AND e2.start_time = e.start_time
                   AND e2.sample_time = p.prev_sample) AS prev_cpu_user_time_s,
                (SELECT cpu_system_time_s
                 FROM events e2
                 WHERE e2.machine_name = e.machine_name
-                  AND e2.pid IS e.pid
+                  AND e2.pid IS NOT DISTINCT FROM e.pid
                   AND e2.start_time = e.start_time
                   AND e2.sample_time = p.prev_sample) AS prev_cpu_system_time_s,
                CASE
                    WHEN p.prev_sample IS NULL OR e.cpu_user_time_s IS NULL THEN NULL
-                   ELSE MAX(0, e.cpu_user_time_s - (SELECT cpu_user_time_s
+                   ELSE (CASE WHEN (SELECT cpu_user_time_s
+                                    FROM events e2
+                                    WHERE e2.machine_name = e.machine_name
+                                      AND e2.pid IS NOT DISTINCT FROM e.pid
+                                      AND e2.start_time = e.start_time
+                                      AND e2.sample_time = p.prev_sample) IS NULL THEN NULL
+                         ELSE GREATEST(0, e.cpu_user_time_s - (SELECT cpu_user_time_s
                                                     FROM events e2
                                                     WHERE e2.machine_name = e.machine_name
-                                                      AND e2.pid IS e.pid
+                                                      AND e2.pid IS NOT DISTINCT FROM e.pid
                                                       AND e2.start_time = e.start_time
-                                                      AND e2.sample_time = p.prev_sample))
+                                                      AND e2.sample_time = p.prev_sample)) END)
                    END                                AS cpu_delta_user_s,
                CASE
                    WHEN p.prev_sample IS NULL OR e.cpu_system_time_s IS NULL THEN NULL
-                   ELSE MAX(0, e.cpu_system_time_s - (SELECT cpu_system_time_s
+                   ELSE (CASE WHEN (SELECT cpu_system_time_s
+                                    FROM events e2
+                                    WHERE e2.machine_name = e.machine_name
+                                      AND e2.pid IS NOT DISTINCT FROM e.pid
+                                      AND e2.start_time = e.start_time
+                                      AND e2.sample_time = p.prev_sample) IS NULL THEN NULL
+                         ELSE GREATEST(0, e.cpu_system_time_s - (SELECT cpu_system_time_s
                                                       FROM events e2
                                                       WHERE e2.machine_name = e.machine_name
-                                                        AND e2.pid IS e.pid
+                                                        AND e2.pid IS NOT DISTINCT FROM e.pid
                                                         AND e2.start_time = e.start_time
-                                                        AND e2.sample_time = p.prev_sample))
+                                                        AND e2.sample_time = p.prev_sample)) END)
                    END                                AS cpu_delta_system_s
         FROM events e
                  JOIN latest l
-                      ON e.machine_name = ? AND e.pid IS l.pid AND e.start_time = l.start_time AND
+                      ON e.machine_name = %s AND e.pid IS NOT DISTINCT FROM l.pid AND e.start_time = l.start_time AND
                          e.sample_time = l.max_sample
                  LEFT JOIN prev p
-                           ON p.pid IS e.pid AND p.start_time = e.start_time
-        ORDER BY e.process_name COLLATE NOCASE
+                           ON p.pid IS NOT DISTINCT FROM e.pid AND p.start_time = e.start_time
+        ORDER BY lower(e.process_name)
         """,
         (machine, since_iso, machine, machine),
     )
@@ -599,7 +611,7 @@ def _latest_samples_by_session(cur: sqlite3.Cursor, machine: str, since_iso: str
     return cur.fetchall()
 
 
-def _group_stopped(rows: List[sqlite3.Row], limit_per_group: int = 80) -> List[Dict[str, Any]]:
+def _group_stopped(rows: List[DbRow], limit_per_group: int = 80) -> List[Dict[str, Any]]:
     groups: Dict[str, Dict[str, Any]] = {}
     for r in rows:
         name = r["process_name"] or "unknown"
@@ -631,12 +643,12 @@ def latest(x_api_key: Optional[str] = Header(default=None), limit_machines: int 
 
     cur.execute(
         """
-        SELECT ms.machine_name, ms.boot_time, ms.os_info, ms.current_user, ms.client_version, ms.last_seen,
+        SELECT ms.machine_name, ms.boot_time, ms.os_info, ms."current_user", ms.client_version, ms.last_seen,
                COALESCE(ma.alias,'') AS alias
         FROM machine_state ms
         LEFT JOIN machine_aliases ma ON ma.machine_name = ms.machine_name
         ORDER BY ms.machine_name
-        LIMIT ?
+        LIMIT %s
         """,
         (int(limit_machines),),
     )
@@ -672,7 +684,7 @@ def latest(x_api_key: Optional[str] = Header(default=None), limit_machines: int 
                 d["end_time"] = d["sample_time"]
             stopped_synth.append(d)
 
-        def _choose_main(group: List[sqlite3.Row]) -> Dict[str, Any]:
+        def _choose_main(group: List[DbRow]) -> Dict[str, Any]:
             g = [dict(x) for x in group]
             pids = {int(x.get("pid") or 0) for x in g if x.get("pid") is not None}
             ppids = {int(x.get("ppid") or 0) for x in g if x.get("ppid") is not None}
@@ -690,7 +702,7 @@ def latest(x_api_key: Optional[str] = Header(default=None), limit_machines: int 
             return candidates[0] if candidates else {}
 
         # Dedup within the slice by process_name -> pick "main" row by rules.
-        running_by_name: Dict[str, List[sqlite3.Row]] = {}
+        running_by_name: Dict[str, List[DbRow]] = {}
         for r in running_rows:
             running_by_name.setdefault(r["process_name"], []).append(r)
 
@@ -775,7 +787,7 @@ def get_chain_catalog(x_api_key: Optional[str] = Header(default=None)):
         """
         SELECT chain_key, chain_name, chain_type, description, updated_at
         FROM chain_catalog
-        ORDER BY chain_name COLLATE NOCASE, chain_key COLLATE NOCASE
+        ORDER BY lower(chain_name), lower(chain_key)
         """
     )
     items = [dict(r) for r in cur.fetchall()]
@@ -804,7 +816,7 @@ def upsert_chain_catalog_item(payload: Dict[str, Any] = Body(...), x_api_key: Op
     cur.execute(
         """
         INSERT INTO chain_catalog(chain_key, chain_name, chain_type, description, updated_at)
-        VALUES(?, ?, ?, ?, ?)
+        VALUES(%s, %s, %s, %s, %s)
         ON CONFLICT(chain_key) DO UPDATE SET
             chain_name=excluded.chain_name,
             chain_type=excluded.chain_type,
@@ -831,7 +843,7 @@ def upsert_process_catalog_item(payload: Dict[str, Any] = Body(...), x_api_key: 
     cur.execute(
         """
         INSERT INTO process_catalog(process_name, description, process_type)
-        VALUES(?, ?, ?)
+        VALUES(%s, %s, %s)
         ON CONFLICT(process_name) DO UPDATE SET
             description=excluded.description,
             process_type=excluded.process_type
@@ -868,7 +880,7 @@ def set_machine_alias(payload: Dict[str, Any] = Body(...), x_api_key: Optional[s
     cur = conn.cursor()
 
     if alias_str == "":
-        cur.execute("DELETE FROM machine_aliases WHERE machine_name=?;", (machine_name,))
+        cur.execute("DELETE FROM machine_aliases WHERE machine_name=%s;", (machine_name,))
         conn.commit()
         conn.close()
         return {"ok": True, "action": "deleted"}
@@ -876,7 +888,7 @@ def set_machine_alias(payload: Dict[str, Any] = Body(...), x_api_key: Optional[s
     cur.execute(
         """
         INSERT INTO machine_aliases(machine_name, alias, updated_at)
-        VALUES(?, ?, ?)
+        VALUES(%s, %s, %s)
         ON CONFLICT(machine_name) DO UPDATE SET
             alias=excluded.alias,
             updated_at=excluded.updated_at
@@ -903,14 +915,14 @@ def get_machines(x_api_key: Optional[str] = Header(default=None), limit: int = 5
                r.role_name AS role_name,
                ms.last_seen AS last_seen,
                ms.os_info AS os_info,
-               ms.current_user AS current_user,
+               ms."current_user" AS "current_user",
                ms.client_version AS client_version
         FROM machine_state ms
         LEFT JOIN machine_aliases ma ON ma.machine_name = ms.machine_name
         LEFT JOIN machine_roles mr ON mr.machine_name = ms.machine_name
         LEFT JOIN roles r ON r.role_id = mr.role_id
         ORDER BY ms.machine_name
-        LIMIT ?
+        LIMIT %s
         """,
         (int(limit),),
     )
@@ -960,11 +972,15 @@ def create_role(payload: Dict[str, Any] = Body(...), x_api_key: Optional[str] = 
     cur = conn.cursor()
     try:
         try:
-            cur.execute("INSERT INTO roles(role_name, description) VALUES(?, ?);", (role_name, description))
+            with conn.transaction():
+                cur.execute(
+                    "INSERT INTO roles(role_name, description) VALUES(%s, %s) RETURNING role_id;",
+                    (role_name, description),
+                )
+                rid = int(cur.fetchone()["role_id"])
             conn.commit()
-            rid = cur.lastrowid
-        except sqlite3.IntegrityError:
-            cur.execute("SELECT role_id FROM roles WHERE role_name=? LIMIT 1;", (role_name,))
+        except UniqueViolation:
+            cur.execute("SELECT role_id FROM roles WHERE role_name=%s LIMIT 1;", (role_name,))
             row = cur.fetchone()
             rid = int(row["role_id"]) if row else None
             conn.commit()
@@ -991,16 +1007,16 @@ def update_role(payload: Dict[str, Any] = Body(...), x_api_key: Optional[str] = 
     try:
         if role_name is None:
             # backward compatible: update description only
-            cur.execute("UPDATE roles SET description=? WHERE role_id=?;", (description, int(role_id)))
+            cur.execute("UPDATE roles SET description=%s WHERE role_id=%s;", (description, int(role_id)))
         else:
             rn = str(role_name).strip()
             if not rn:
                 raise HTTPException(status_code=400, detail="role_name is required")
-            cur.execute("UPDATE roles SET role_name=?, description=? WHERE role_id=?;", (rn, description, int(role_id)))
+            cur.execute("UPDATE roles SET role_name=%s, description=%s WHERE role_id=%s;", (rn, description, int(role_id)))
             if allowed_process_types is not None:
                 _replace_role_allowed_process_types(cur, int(role_id), allowed_process_types)
         conn.commit()
-    except sqlite3.IntegrityError:
+    except UniqueViolation:
         raise HTTPException(status_code=400, detail="role_name must be unique")
     finally:
         conn.close()
@@ -1036,12 +1052,12 @@ def set_machine_role(payload: Dict[str, Any] = Body(...), x_api_key: Optional[st
     conn = db_connect()
     cur = conn.cursor()
     if role_id is None:
-        cur.execute("DELETE FROM machine_roles WHERE machine_name=?;", (machine_name,))
+        cur.execute("DELETE FROM machine_roles WHERE machine_name=%s;", (machine_name,))
     else:
         cur.execute(
             """
             INSERT INTO machine_roles(machine_name, role_id, updated_at)
-            VALUES(?, ?, ?)
+            VALUES(%s, %s, %s)
             ON CONFLICT(machine_name) DO UPDATE SET role_id=excluded.role_id, updated_at=excluded.updated_at
             """,
             (machine_name, int(role_id), now),
@@ -1078,16 +1094,16 @@ def _bucket_hour_from_sample(sample_time: str) -> str:
     return dt.strftime("%Y-%m-%dT%H")
 
 
-def _session_key_from_row(r: sqlite3.Row) -> Tuple[str, int, str]:
+def _session_key_from_row(r: DbRow) -> Tuple[str, int, str]:
     return (str(r["machine_name"]), int(r["pid"] or 0), str(r["start_time"]))
 
 
-def _get_latest_and_prev_for_session(cur: sqlite3.Cursor, machine: str, pid: int, start_time: str, current_sample: str) -> Tuple[Optional[sqlite3.Row], Optional[sqlite3.Row]]:
+def _get_latest_and_prev_for_session(cur: DbCursor, machine: str, pid: int, start_time: str, current_sample: str) -> Tuple[Optional[DbRow], Optional[DbRow]]:
     cur.execute(
         """
         SELECT *
         FROM events
-        WHERE machine_name=? AND pid IS ? AND start_time=? AND sample_time<=?
+        WHERE machine_name=%s AND pid IS NOT DISTINCT FROM %s AND start_time=%s AND sample_time<=%s
         ORDER BY sample_time DESC
         LIMIT 2
         """,
@@ -1102,7 +1118,7 @@ def _get_latest_and_prev_for_session(cur: sqlite3.Cursor, machine: str, pid: int
 
 
 def _collect_baseline_values(
-    cur: sqlite3.Cursor,
+    cur: DbCursor,
     metric: str,
     user_name: str,
     sha256: str,
@@ -1126,8 +1142,8 @@ def _collect_baseline_values(
                 f"""
                 SELECT {metric_col} AS v
                 FROM events
-                WHERE user_name=? AND NULLIF(sha256,'') IS NOT NULL AND sha256=?
-                  AND sample_time>=? AND sample_time<?
+                WHERE user_name=%s AND NULLIF(sha256,'') IS NOT NULL AND sha256=%s
+                  AND sample_time>=%s AND sample_time<%s
                   AND {metric_col} IS NOT NULL
                 """,
                 (user_name, sha256, since_iso, until_iso),
@@ -1137,8 +1153,8 @@ def _collect_baseline_values(
                 f"""
                 SELECT {metric_col} AS v
                 FROM events
-                WHERE user_name=? AND (sha256 IS NULL OR sha256='') AND exe_path=?
-                  AND sample_time>=? AND sample_time<?
+                WHERE user_name=%s AND (sha256 IS NULL OR sha256='') AND exe_path=%s
+                  AND sample_time>=%s AND sample_time<%s
                   AND {metric_col} IS NOT NULL
                 """,
                 (user_name, exe_path, since_iso, until_iso),
@@ -1158,8 +1174,8 @@ def _collect_baseline_values(
                    cpu_user_time_s, cpu_system_time_s,
                    io_read_bytes, io_write_bytes
             FROM events
-            WHERE user_name=? AND NULLIF(sha256,'') IS NOT NULL AND sha256=?
-              AND sample_time>=? AND sample_time<?
+            WHERE user_name=%s AND NULLIF(sha256,'') IS NOT NULL AND sha256=%s
+              AND sample_time>=%s AND sample_time<%s
             ORDER BY machine_name, pid, start_time, sample_time
             """,
             (user_name, sha256, since_iso, until_iso),
@@ -1171,8 +1187,8 @@ def _collect_baseline_values(
                    cpu_user_time_s, cpu_system_time_s,
                    io_read_bytes, io_write_bytes
             FROM events
-            WHERE user_name=? AND (sha256 IS NULL OR sha256='') AND exe_path=?
-              AND sample_time>=? AND sample_time<?
+            WHERE user_name=%s AND (sha256 IS NULL OR sha256='') AND exe_path=%s
+              AND sample_time>=%s AND sample_time<%s
             ORDER BY machine_name, pid, start_time, sample_time
             """,
             (user_name, exe_path, since_iso, until_iso),
@@ -1248,11 +1264,12 @@ def _make_alert_dedup_key(alert: Dict[str, Any]) -> str:
     return f"{alert['machine_name']}|{alert['user_name']}|{_binary_key(alert.get('sha256'), alert.get('exe_path'), alert.get('process_name') or '')}|{alert['metric']}|{alert['bucket_hour']}"
 
 
-def _try_insert_alert(cur: sqlite3.Cursor, alert: Dict[str, Any]) -> bool:
+def _try_insert_alert(cur: DbCursor, alert: Dict[str, Any]) -> bool:
     try:
-        cur.execute(
-            """
-            INSERT OR IGNORE INTO alerts(
+        with cur.connection.transaction():
+            cur.execute(
+                """
+            INSERT INTO alerts(
                 created_at, sample_time,
                 machine_name, user_name,
                 entity_type,
@@ -1262,7 +1279,8 @@ def _try_insert_alert(cur: sqlite3.Cursor, alert: Dict[str, Any]) -> bool:
                 metric, value, baseline, score, severity, reason,
                 status, ack_by, ack_at, closed_at,
                 bucket_hour, dedup_key
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (dedup_key) DO NOTHING
             """,
             (
                 alert["created_at"],
@@ -1292,13 +1310,13 @@ def _try_insert_alert(cur: sqlite3.Cursor, alert: Dict[str, Any]) -> bool:
                 alert["bucket_hour"],
                 alert["dedup_key"],
             ),
-        )
+            )
         return cur.rowcount > 0
     except Exception:
         return False
 
 
-def _load_parent_context(cur: sqlite3.Cursor, latest: sqlite3.Row) -> Optional[Dict[str, Any]]:
+def _load_parent_context(cur: DbCursor, latest: DbRow) -> Optional[Dict[str, Any]]:
     machine = str(latest["machine_name"] or "")
     ppid = latest["ppid"]
     if ppid is None:
@@ -1313,8 +1331,8 @@ def _load_parent_context(cur: sqlite3.Cursor, latest: sqlite3.Row) -> Optional[D
         """
         SELECT *
         FROM events
-        WHERE machine_name=? AND pid=?
-          AND sample_time<=?
+        WHERE machine_name=%s AND pid=%s
+          AND sample_time<=%s
         ORDER BY sample_time DESC
         LIMIT 20
         """,
@@ -1354,7 +1372,7 @@ def _load_parent_context(cur: sqlite3.Cursor, latest: sqlite3.Row) -> Optional[D
     }
 
 def _count_prior_binary_sessions(
-    cur: sqlite3.Cursor,
+    cur: DbCursor,
     machine: str,
     user_name: str,
     pid: int,
@@ -1367,27 +1385,27 @@ def _count_prior_binary_sessions(
     params: List[Any] = [machine, sample_time, machine, int(pid), start_time]
 
     if sha256:
-        match_sql = "NULLIF(sha256, '') IS NOT NULL AND sha256=?"
+        match_sql = "NULLIF(sha256, '') IS NOT NULL AND sha256=%s"
         params.append(sha256)
     elif exe_path:
-        match_sql = "lower(COALESCE(exe_path, ''))=?"
+        match_sql = "lower(COALESCE(exe_path, ''))=%s"
         params.append(exe_path.lower())
     else:
-        match_sql = "lower(process_name)=?"
+        match_sql = "lower(process_name)=%s"
         params.append(process_name.lower())
 
     user_sql = ""
     if user_name:
-        user_sql = " AND COALESCE(user_name, '')=?"
+        user_sql = " AND COALESCE(user_name, '')=%s"
         params.append(user_name)
 
     cur.execute(
         f"""
-        SELECT COUNT(DISTINCT machine_name || '|' || COALESCE(pid, '') || '|' || start_time) AS c
+        SELECT COUNT(DISTINCT machine_name || '|' || COALESCE(pid::text, '') || '|' || start_time) AS c
         FROM events
-        WHERE machine_name=?
-          AND sample_time < ?
-          AND NOT (machine_name=? AND COALESCE(pid, 0)=? AND start_time=?)
+        WHERE machine_name=%s
+          AND sample_time < %s
+          AND NOT (machine_name=%s AND COALESCE(pid, 0)=%s AND start_time=%s)
           AND {match_sql}
           {user_sql}
         """,
@@ -1396,16 +1414,16 @@ def _count_prior_binary_sessions(
     row = cur.fetchone()
     return int((row["c"] if row else 0) or 0)
 
-def _process_in_catalog(cur: sqlite3.Cursor, process_name: str) -> bool:
+def _process_in_catalog(cur: DbCursor, process_name: str) -> bool:
     cur.execute(
-        "SELECT 1 FROM process_catalog WHERE lower(process_name)=lower(?) LIMIT 1;",
+        "SELECT 1 FROM process_catalog WHERE lower(process_name)=lower(%s) LIMIT 1;",
         (process_name.strip(),),
     )
     return cur.fetchone() is not None
 
 
 def _count_process_sessions_on_machine(
-    cur: sqlite3.Cursor,
+    cur: DbCursor,
     machine: str,
     pid: int,
     start_time: str,
@@ -1414,12 +1432,12 @@ def _count_process_sessions_on_machine(
 ) -> int:
     cur.execute(
         """
-        SELECT COUNT(DISTINCT machine_name || '|' || COALESCE(pid, '') || '|' || start_time) AS c
+        SELECT COUNT(DISTINCT machine_name || '|' || COALESCE(pid::text, '') || '|' || start_time) AS c
         FROM events
-        WHERE machine_name=?
-          AND sample_time < ?
-          AND lower(process_name)=lower(?)
-          AND NOT (machine_name=? AND COALESCE(pid, 0)=? AND start_time=?)
+        WHERE machine_name=%s
+          AND sample_time < %s
+          AND lower(process_name)=lower(%s)
+          AND NOT (machine_name=%s AND COALESCE(pid, 0)=%s AND start_time=%s)
         """,
         (machine, sample_time, process_name, machine, int(pid), start_time),
     )
@@ -1427,7 +1445,7 @@ def _count_process_sessions_on_machine(
     return int((row["c"] if row else 0) or 0)
 
 def _count_prior_chain_sessions(
-    cur: sqlite3.Cursor,
+    cur: DbCursor,
     machine: str,
     user_name: str,
     pid: int,
@@ -1440,7 +1458,7 @@ def _count_prior_chain_sessions(
 
     user_sql = ""
     if user_name:
-        user_sql = " AND COALESCE(c.user_name, '')=?"
+        user_sql = " AND COALESCE(c.user_name, '')=%s"
         params.append(user_name)
 
     cur.execute(
@@ -1455,11 +1473,16 @@ def _count_prior_chain_sessions(
               sample_time,
               end_time,
               COALESCE(NULLIF(sha256, ''), 'path:' || lower(COALESCE(exe_path, '')), 'name:' || lower(process_name)) AS child_key
-          FROM events
-          WHERE machine_name=?
-            AND sample_time < ?
-            AND NOT (machine_name=? AND COALESCE(pid, 0)=? AND start_time=?)
-          GROUP BY machine_name, pid, start_time
+          FROM (
+            -- одна строка на сессию (в SQLite это делал GROUP BY с "голыми" колонками);
+            -- берём последний сэмпл сессии
+            SELECT DISTINCT ON (machine_name, pid, start_time) *
+            FROM events
+            WHERE machine_name=%s
+              AND sample_time < %s
+              AND NOT (machine_name=%s AND COALESCE(pid, 0)=%s AND start_time=%s)
+            ORDER BY machine_name, pid, start_time, sample_time DESC
+          ) AS last_samples
         ),
         parent_candidates AS (
           SELECT
@@ -1471,15 +1494,15 @@ def _count_prior_chain_sessions(
               COALESCE(NULLIF(sha256, ''), 'path:' || lower(COALESCE(exe_path, '')), 'name:' || lower(process_name)) AS parent_key
           FROM events
         )
-        SELECT COUNT(DISTINCT c.machine_name || '|' || COALESCE(c.pid, '') || '|' || c.start_time) AS c
+        SELECT COUNT(DISTINCT c.machine_name || '|' || COALESCE(c.pid::text, '') || '|' || c.start_time) AS c
         FROM child_sessions c
         JOIN parent_candidates p
           ON p.machine_name = c.machine_name
          AND p.pid = c.ppid
          AND p.start_time <= c.start_time
          AND (p.end_time IS NULL OR p.end_time = '' OR p.end_time >= c.start_time)
-        WHERE c.child_key=?
-          AND p.parent_key=?
+        WHERE c.child_key=%s
+          AND p.parent_key=%s
           {user_sql}
         """,
         params + [child_key, parent_key],
@@ -1487,17 +1510,17 @@ def _count_prior_chain_sessions(
     row = cur.fetchone()
     return int((row["c"] if row else 0) or 0)
 
-def _chain_in_catalog(cur: sqlite3.Cursor, chain_key: str) -> bool:
-    cur.execute("SELECT 1 FROM chain_catalog WHERE chain_key=? LIMIT 1;", (chain_key,))
+def _chain_in_catalog(cur: DbCursor, chain_key: str) -> bool:
+    cur.execute("SELECT 1 FROM chain_catalog WHERE chain_key=%s LIMIT 1;", (chain_key,))
     return cur.fetchone() is not None
 
-def _get_machine_role_profile(cur: sqlite3.Cursor, machine_name: str) -> Optional[Dict[str, Any]]:
+def _get_machine_role_profile(cur: DbCursor, machine_name: str) -> Optional[Dict[str, Any]]:
     cur.execute(
         """
         SELECT r.role_id, r.role_name
         FROM machine_roles mr
         JOIN roles r ON r.role_id = mr.role_id
-        WHERE mr.machine_name = ?
+        WHERE mr.machine_name = %s
         LIMIT 1
         """,
         (machine_name,),
@@ -1512,12 +1535,12 @@ def _get_machine_role_profile(cur: sqlite3.Cursor, machine_name: str) -> Optiona
     item["allowed_types_text"] = ", ".join(allowed_process_types)
     return item
 
-def _get_process_type(cur: sqlite3.Cursor, process_name: str) -> str:
+def _get_process_type(cur: DbCursor, process_name: str) -> str:
     cur.execute(
         """
         SELECT process_type
         FROM process_catalog
-        WHERE lower(process_name) = lower(?)
+        WHERE lower(process_name) = lower(%s)
         LIMIT 1
         """,
         (process_name.strip(),),
@@ -1549,13 +1572,13 @@ def _normalize_allowed_process_types(raw: Any) -> List[str]:
     return out
 
 
-def _get_role_allowed_process_types(cur: sqlite3.Cursor, role_id: int) -> List[str]:
+def _get_role_allowed_process_types(cur: DbCursor, role_id: int) -> List[str]:
     cur.execute(
         """
         SELECT process_type
         FROM role_allowed_process_types
-        WHERE role_id = ?
-        ORDER BY process_type COLLATE NOCASE
+        WHERE role_id = %s
+        ORDER BY lower(process_type)
         """,
         (int(role_id),),
     )
@@ -1563,9 +1586,9 @@ def _get_role_allowed_process_types(cur: sqlite3.Cursor, role_id: int) -> List[s
     return [str(row["process_type"]).strip() for row in rows if str(row["process_type"] or "").strip()]
 
 
-def _replace_role_allowed_process_types(cur: sqlite3.Cursor, role_id: int, raw: Any) -> List[str]:
+def _replace_role_allowed_process_types(cur: DbCursor, role_id: int, raw: Any) -> List[str]:
     allowed_process_types = _normalize_allowed_process_types(raw)
-    cur.execute("DELETE FROM role_allowed_process_types WHERE role_id=?;", (int(role_id),))
+    cur.execute("DELETE FROM role_allowed_process_types WHERE role_id=%s;", (int(role_id),))
 
     if not allowed_process_types:
         return []
@@ -1574,14 +1597,14 @@ def _replace_role_allowed_process_types(cur: sqlite3.Cursor, role_id: int, raw: 
     cur.executemany(
         """
         INSERT INTO role_allowed_process_types(role_id, process_type, updated_at)
-        VALUES(?, ?, ?)
+        VALUES(%s, %s, %s)
         """,
         [(int(role_id), process_type, now) for process_type in allowed_process_types],
     )
     return allowed_process_types
 
 def _typical_hours_for_process(
-    cur: sqlite3.Cursor,
+    cur: DbCursor,
     machine: str,
     user_name: str,
     pid: int,
@@ -1595,18 +1618,18 @@ def _typical_hours_for_process(
     params: List[Any] = [machine, sample_time, machine, int(pid), start_time]
 
     if sha256:
-        match_sql = "NULLIF(sha256, '') IS NOT NULL AND sha256=?"
+        match_sql = "NULLIF(sha256, '') IS NOT NULL AND sha256=%s"
         params.append(sha256)
     elif exe_path:
-        match_sql = "lower(COALESCE(exe_path, ''))=?"
+        match_sql = "lower(COALESCE(exe_path, ''))=%s"
         params.append(exe_path.lower())
     else:
-        match_sql = "lower(process_name)=?"
+        match_sql = "lower(process_name)=%s"
         params.append(process_name.lower())
 
     user_sql = ""
     if user_name:
-        user_sql = " AND COALESCE(user_name, '')=?"
+        user_sql = " AND COALESCE(user_name, '')=%s"
         params.append(user_name)
 
     cur.execute(
@@ -1614,11 +1637,11 @@ def _typical_hours_for_process(
         WITH sessions AS (
           SELECT
               start_time,
-              machine_name || '|' || COALESCE(pid, '') || '|' || start_time AS session_key
+              machine_name || '|' || COALESCE(pid::text, '') || '|' || start_time AS session_key
           FROM events
-          WHERE machine_name=?
-            AND sample_time < ?
-            AND NOT (machine_name=? AND COALESCE(pid, 0)=? AND start_time=?)
+          WHERE machine_name=%s
+            AND sample_time < %s
+            AND NOT (machine_name=%s AND COALESCE(pid, 0)=%s AND start_time=%s)
             AND {match_sql}
             {user_sql}
           GROUP BY machine_name, pid, start_time
@@ -1973,15 +1996,15 @@ def analytics_rare(x_api_key: Optional[str] = Header(default=None), days: int = 
         SELECT COALESCE(NULLIF(sha256, ''), 'path:' || lower(COALESCE(exe_path, '')))        AS bin_key,
                MIN(process_name)                                                             AS process_name,
 
-               COUNT(DISTINCT machine_name || '|' || COALESCE(pid, '') || '|' || start_time) AS sessions,
+               COUNT(DISTINCT machine_name || '|' || COALESCE(pid::text, '') || '|' || start_time) AS sessions,
                COUNT(DISTINCT machine_name)                                                  AS machines,
                COUNT(DISTINCT COALESCE(user_name, ''))                                       AS users,
-               GROUP_CONCAT(DISTINCT machine_name)                                           AS machine_names
+               string_agg(DISTINCT machine_name, ',')                                        AS machine_names
 
         FROM events
-        WHERE sample_time >= ?
+        WHERE sample_time >= %s
         GROUP BY bin_key
-        ORDER BY sessions ASC, machines ASC, users ASC LIMIT ?
+        ORDER BY sessions ASC, machines ASC, users ASC LIMIT %s
         """,
         (since, limit),
     )
@@ -2003,7 +2026,7 @@ def analytics_rare(x_api_key: Optional[str] = Header(default=None), days: int = 
             lower(process_name) AS child_name,
             COALESCE(user_name,'') AS user_name
           FROM events
-          WHERE sample_time >= ? AND ppid IS NOT NULL
+          WHERE sample_time >= %s AND ppid IS NOT NULL
         ),
         p AS (
           SELECT
@@ -2011,7 +2034,7 @@ def analytics_rare(x_api_key: Optional[str] = Header(default=None), days: int = 
             COALESCE(NULLIF(sha256,''), 'path:' || lower(COALESCE(exe_path,''))) AS parent_key,
             lower(process_name) AS parent_name
           FROM events
-          WHERE sample_time >= ?
+          WHERE sample_time >= %s
         )
         SELECT
           (p.parent_key || ' -> ' || c.child_key) AS chain_key,
@@ -2023,7 +2046,7 @@ def analytics_rare(x_api_key: Optional[str] = Header(default=None), days: int = 
           COUNT(DISTINCT c.machine_name || '|' || c.pid || '|' || c.start_time) AS sessions,
           COUNT(DISTINCT c.machine_name) AS machines,
           COUNT(DISTINCT c.user_name) AS users,
-          GROUP_CONCAT(DISTINCT c.machine_name) AS machine_names,
+          string_agg(DISTINCT c.machine_name, ',') AS machine_names,
           CASE WHEN MIN(p.parent_name)=MIN(c.child_name) THEN 1 ELSE 0 END AS self_chain
 
 
@@ -2032,9 +2055,9 @@ def analytics_rare(x_api_key: Optional[str] = Header(default=None), days: int = 
           ON p.machine_name = c.machine_name
          AND p.sample_time  = c.sample_time
          AND p.pid          = c.ppid
-        GROUP BY chain_key
+        GROUP BY p.parent_key, c.child_key
         ORDER BY sessions ASC, machines ASC
-        LIMIT ?
+        LIMIT %s
         """,
         (since, since, limit),
     )
@@ -2129,8 +2152,8 @@ def analytics_host_profile(machine_name: str, x_api_key: Optional[str] = Header(
                                       AND lower(c.process_name) = lower(e.process_name)
                                       AND c.ppid = e.pid) AS has_children
                       FROM events e
-                      WHERE e.machine_name = ?
-                        AND e.sample_time >= ?),
+                      WHERE e.machine_name = %s
+                        AND e.sample_time >= %s),
              mains AS (SELECT *,
                               ROW_NUMBER() OVER (
                    PARTITION BY lower(process_name), sample_time
@@ -2143,7 +2166,7 @@ def analytics_host_profile(machine_name: str, x_api_key: Optional[str] = Header(
                           MIN(sample_time)      AS first_seen,
                           MAX(sample_time)      AS last_seen,
                           MAX(duration_seconds) AS max_dur,
-            date (MIN (sample_time)) AS day
+            left(MIN(sample_time), 10) AS day
         FROM mains
         WHERE rn = 1
         GROUP BY process_name, pid, start_time
@@ -2151,10 +2174,10 @@ def analytics_host_profile(machine_name: str, x_api_key: Optional[str] = Header(
         SELECT process_name,
                COUNT(*)            AS runs,
                COUNT(DISTINCT day) AS seen_days,
-               AVG(max_dur)        AS avg_duration_s
+               AVG(max_dur)::double precision AS avg_duration_s
         FROM s
         GROUP BY process_name
-        ORDER BY runs DESC LIMIT ?
+        ORDER BY runs DESC LIMIT %s
         """,
         (machine, since, limit),
     )
@@ -2179,10 +2202,10 @@ def analytics_process_names(
         SELECT MIN(process_name) AS process_name, lower(process_name) AS pname, COUNT(*) AS rows_count
         FROM events
         WHERE TRIM(COALESCE(process_name, '')) <> ''
-          AND (? = '' OR lower(process_name) LIKE '%' || ? || '%')
+          AND (%s = '' OR lower(process_name) LIKE '%%' || %s || '%%')
         GROUP BY lower(process_name)
         ORDER BY rows_count DESC, pname ASC
-        LIMIT ?
+        LIMIT %s
         """,
         (needle, needle, max(1, min(int(limit), 500))),
     )
@@ -2222,8 +2245,8 @@ def analytics_process_profile(
             net_active,
             net_conn_count
         FROM events
-        WHERE lower(process_name) = lower(?)
-          AND sample_time >= ?
+        WHERE lower(process_name) = lower(%s)
+          AND sample_time >= %s
         ORDER BY machine_name, user_name, pid, start_time, sample_time
         """,
         (pname, since),
@@ -2337,13 +2360,13 @@ def analytics_time_anomalies(x_api_key: Optional[str] = Header(default=None), da
         WITH latest AS (
           SELECT machine_name, pid, start_time, MAX(sample_time) AS max_sample
           FROM events
-          WHERE sample_time >= ?
+          WHERE sample_time >= %s
           GROUP BY machine_name, pid, start_time
         )
         SELECT e.*
         FROM events e
         JOIN latest l
-          ON e.machine_name=l.machine_name AND e.pid IS l.pid AND e.start_time=l.start_time AND e.sample_time=l.max_sample
+          ON e.machine_name=l.machine_name AND e.pid IS NOT DISTINCT FROM l.pid AND e.start_time=l.start_time AND e.sample_time=l.max_sample
         ORDER BY e.start_time DESC
         LIMIT 1000
         """,
@@ -2416,10 +2439,10 @@ def analytics_chain_keys(
          AND p.pid = c.ppid
          AND p.start_time <= c.start_time
          AND (p.end_time IS NULL OR p.end_time = '' OR p.end_time >= c.start_time)
-        WHERE c.sample_time >= ?
+        WHERE c.sample_time >= %s
         GROUP BY chain_key
         ORDER BY rows_count DESC, chain_key ASC
-        LIMIT ?
+        LIMIT %s
         """,
         (since, max(1, min(int(limit), 500))),
     )
@@ -2448,13 +2471,13 @@ def analytics_chains(
     conn = db_connect()
     cur = conn.cursor()
 
-    wh = ["sample_time >= ?"]
+    wh = ["sample_time >= %s"]
     params: List[Any] = [since]
     if machine:
-        wh.append("machine_name = ?")
+        wh.append("machine_name = %s")
         params.append(machine)
     if proc:
-        wh.append("lower(process_name) = ?")
+        wh.append("lower(process_name) = %s")
         params.append(proc)
 
     cur.execute(
@@ -2570,25 +2593,25 @@ def get_alerts(
     params: List[Any] = []
 
     if since.strip():
-        wh.append("created_at >= ?")
+        wh.append("created_at >= %s")
         params.append(since.strip())
     if status.strip():
-        wh.append("status = ?")
+        wh.append("status = %s")
         params.append(status.strip())
     if severity.strip():
-        wh.append("severity = ?")
+        wh.append("severity = %s")
         params.append(severity.strip())
     if machine.strip():
-        wh.append("machine_name = ?")
+        wh.append("machine_name = %s")
         params.append(machine.strip())
     if user.strip():
-        wh.append("user_name = ?")
+        wh.append("user_name = %s")
         params.append(user.strip())
     if metric.strip():
-        wh.append("metric = ?")
+        wh.append("metric = %s")
         params.append(metric.strip())
     if entity_type.strip():
-        wh.append("entity_type = ?")
+        wh.append("entity_type = %s")
         params.append(entity_type.strip())
 
     where_sql = ("WHERE " + " AND ".join(wh)) if wh else ""
@@ -2617,7 +2640,7 @@ def get_alerts(
         FROM alerts
         {where_sql}
         ORDER BY created_at DESC, id DESC
-        LIMIT ? OFFSET ?
+        LIMIT %s OFFSET %s
         """,
         params + [lim, off],
     )
@@ -2641,8 +2664,8 @@ def ack_alert(
     cur.execute(
         """
         UPDATE alerts
-        SET status='ack', ack_by=?, ack_at=?
-        WHERE id=?
+        SET status='ack', ack_by=%s, ack_at=%s
+        WHERE id=%s
         """,
         (ack_by, now, int(alert_id)),
     )
@@ -2667,8 +2690,8 @@ def close_alert(
     cur.execute(
         """
         UPDATE alerts
-        SET status='closed', ack_by=COALESCE(ack_by, ?), ack_at=COALESCE(ack_at, ?), closed_at=?
-        WHERE id=?
+        SET status='closed', ack_by=COALESCE(ack_by, %s), ack_at=COALESCE(ack_at, %s), closed_at=%s
+        WHERE id=%s
         """,
         (by, now, now, int(alert_id)),
     )
@@ -2700,7 +2723,7 @@ def set_alert_status(
             """
             UPDATE alerts
             SET status='new', ack_by=NULL, ack_at=NULL, closed_at=NULL
-            WHERE id=?
+            WHERE id=%s
             """,
             (int(alert_id),),
         )
@@ -2708,8 +2731,8 @@ def set_alert_status(
         cur.execute(
             """
             UPDATE alerts
-            SET status='ack', ack_by=?, ack_at=?, closed_at=NULL
-            WHERE id=?
+            SET status='ack', ack_by=%s, ack_at=%s, closed_at=NULL
+            WHERE id=%s
             """,
             (by, now, int(alert_id)),
         )
@@ -2717,8 +2740,8 @@ def set_alert_status(
         cur.execute(
             """
             UPDATE alerts
-            SET status='closed', ack_by=COALESCE(ack_by, ?), ack_at=COALESCE(ack_at, ?), closed_at=?
-            WHERE id=?
+            SET status='closed', ack_by=COALESCE(ack_by, %s), ack_at=COALESCE(ack_at, %s), closed_at=%s
+            WHERE id=%s
             """,
             (by, now, now, int(alert_id)),
         )

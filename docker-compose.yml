@@ -1,4 +1,25 @@
 services:
+  postgres:
+    # PostgreSQL 18 — актуальная стабильная мажорная версия на момент миграции (сентябрь 2026)
+    image: postgres:18
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-monitoring}
+      # Пароль только из окружения хоста или .env (см. .env.example)
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in host environment or .env}
+      POSTGRES_DB: ${POSTGRES_DB:-monitoring}
+      # Локаль C.UTF-8: сортировка и сравнение TEXT по кодам символов, как в SQLite
+      # (BINARY). Даты хранятся как TEXT и сравниваются как строки — порядок
+      # должен совпадать с прежним.
+      POSTGRES_INITDB_ARGS: "--locale=C.UTF-8"
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-monitoring} -d ${POSTGRES_DB:-monitoring}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
   server:
     build:
       context: .
@@ -12,9 +33,10 @@ services:
       # см. .env.example). Без MONITORING_API_KEY compose откажется стартовать.
       MONITORING_API_KEY: ${MONITORING_API_KEY:?set MONITORING_API_KEY in host environment or .env}
       MONITORING_CLIENT_UPDATE_KEY: ${MONITORING_CLIENT_UPDATE_KEY:-}
-    volumes:
-      # SQLite-файл живёт в named volume, переживает пересоздание контейнера
-      - server_data:/app/data
+      MONITORING_DATABASE_URL: postgresql://${POSTGRES_USER:-monitoring}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-monitoring}
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
 
   # Прогон тестов внутри контейнера: docker compose run --rm tests
@@ -28,4 +50,4 @@ services:
     command: ["python", "-m", "pytest", "tests", "-v"]
 
 volumes:
-  server_data:
+  postgres_data:

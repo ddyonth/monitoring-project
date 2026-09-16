@@ -23,13 +23,9 @@ COPY server/server_app.py server/config.json ./server/
 COPY server/templates ./server/templates
 COPY server/static ./server/static
 
-# DB_PATH захардкожен как <dir server_app.py>/server.db и не настраивается,
-# поэтому файл БД выносим в /app/data через симлинк — этот каталог монтируется
-# как volume в docker-compose. SQLite резолвит симлинк и кладёт journal-файл
-# рядом с реальным файлом, т.е. тоже в volume.
+# Данные живут в Postgres (см. docker-compose.yml), в контейнере сервера
+# ничего персистентного нет.
 RUN useradd --system --uid 1001 --home /app --shell /usr/sbin/nologin app \
-    && mkdir -p /app/data \
-    && ln -s /app/data/server.db /app/server/server.db \
     && chown -R app:app /app
 
 USER app

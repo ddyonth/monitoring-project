@@ -6,14 +6,14 @@
 
 - клиентский агент собирает сведения о запущенных процессах, пользователе, машине и базовых метриках активности;
 - агент сохраняет локальный буфер в SQLite и отправляет данные на сервер по HTTP(S);
-- сервер принимает события, хранит их в SQLite и показывает данные через веб-панель;
+- сервер принимает события, хранит их в PostgreSQL и показывает данные через веб-панель;
 - в серверной части есть справочники процессов и цепочек, роли машин и базовая логика оповещений;
 - система помогает видеть, какие процессы запускались, на каких машинах, кем и насколько это похоже на нормальный профиль работы.
 
 ## Структура проекта
 
 - `client/` — агент сбора активности, локальная БД `activity.db`, конфиг и файлы сборки.
-- `server/` — FastAPI-сервер, серверная БД `server.db`, HTML/JS-панель и конфиг.
+- `server/` — FastAPI-сервер (хранение в PostgreSQL), HTML/JS-панель, конфиг и Dockerfile.
 - `requirements.txt` — зависимости Python для клиента и сервера.
 
 ## Основные возможности
@@ -29,7 +29,7 @@
 
 - Python
 - FastAPI
-- SQLite
+- PostgreSQL (сервер), SQLite (локальный буфер агента)
 - psutil
 - Jinja2
 - PyInstaller
@@ -94,17 +94,24 @@ MONITORING_API_KEY=секрет python server/server_app.py
 ## Запуск сервера в Docker
 
 Образ описан в `server/Dockerfile` (python:3.11-slim), контекст сборки — корень
-репозитория. `docker-compose.yml` поднимает сервис `server` на порту 8000; файл
-SQLite хранится в named volume `server_data` и переживает пересоздание контейнера.
+репозитория. `docker-compose.yml` поднимает два сервиса: `postgres` (PostgreSQL 18,
+данные в named volume `postgres_data`) и `server` на порту 8000.
 
-Секрет передаётся из окружения хоста (или из `.env` рядом с compose-файлом,
-см. `.env.example`); без `MONITORING_API_KEY` compose не стартует:
+Сервер хранит данные в PostgreSQL (psycopg 3). Строка подключения берётся из
+`MONITORING_DATABASE_URL` (в compose собирается автоматически из `POSTGRES_*`).
+Секреты передаются из окружения хоста или из `.env` рядом с compose-файлом
+(см. `.env.example`); без `MONITORING_API_KEY` и `POSTGRES_PASSWORD` compose
+не стартует:
 
 ```bash
 export MONITORING_API_KEY=секрет
+export POSTGRES_PASSWORD=пароль_бд
 docker compose up -d --build
 curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8000/
 ```
+
+База создаётся с локалью `C.UTF-8`: даты хранятся как TEXT в ISO-формате и
+сравниваются как строки, порядок сравнения такой же, как раньше в SQLite.
 
 Тесты внутри того же контейнерного окружения (стадия `test` в Dockerfile):
 
