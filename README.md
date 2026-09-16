@@ -61,6 +61,78 @@ python server/server_app.py
 python client/client_agent.py
 ```
 
+## Клиентский агент: версия, обновление, автозапуск
+
+### Версия и релизы
+
+Версия агента хранится в одном файле `client/VERSION` (например `1.2`). При сборке
+`client/client_agent.spec` генерирует из него модуль `_version.py` и PyInstaller
+вшивает его в exe, поэтому в рантайме с диска ничего не читается. Для локальной
+проверки другой версии достаточно поменять файл и пересобрать, без правки `.py`:
+
+```bash
+echo "1.3" > client/VERSION
+pyinstaller client/client_agent.spec --distpath client/dist --workpath client/build --noconfirm
+git checkout client/VERSION
+```
+
+Релизы хранятся на сервере в Postgres (таблица `client_releases`), текущий —
+последний загруженный. Публикация (ключ `api_key`, не ключ агента):
+
+```bash
+curl -sS --fail -X POST -H "X-API-Key: $MONITORING_API_KEY" \
+  -F version=1.3 -F file=@client/dist/client_agent.exe \
+  http://127.0.0.1:8000/api/client-release
+```
+
+Агент читает метаданные `GET /api/client-release` и скачивает
+`GET /api/download/client-agent` с заголовком `X-Client-Key`
+(`client_update_key` в `client/config.json`, переопределяется переменной
+`MONITORING_CLIENT_UPDATE_KEY`). Базовый адрес сервера выводится из
+`server_ingest_url` (суффикс `/api/ingest` отбрасывается).
+
+### Самообновление
+
+Раз в цикл (после отправки данных, не в режиме `--once`) агент сравнивает версию
+релиза со своей (как числа через точку, `1.10` > `1.9`). Если релиз новее:
+скачивает его в `client_agent.exe.download` рядом с собой, пересчитывает sha256
+и сверяет с метаданными, при совпадении переименовывает текущий exe в
+`client_agent.exe.old`, ставит новый на его место, запускает его с теми же
+аргументами независимо от себя и завершается. `.old` удаляется при следующем
+старте. Подписи релиза нет: целостность — sha256 плюс ключ и HTTPS канала.
+
+Ручная проверка без Планировщика: `client_agent.exe --apply-update-now` делает
+одну проверку/установку и выходит (код 0 — обновлять нечего или обновлено,
+1 — ошибка: sha256 не совпал, скачивание не удалось, запуск не из exe).
+
+Важно: упакованный onefile-exe **не читает `config.json` рядом с собой**
+(`__file__` в PyInstaller указывает во временный каталог), поэтому адрес сервера
+берётся из встроенного значения по умолчанию, а ключи — из переменных окружения
+пользователя (`setx MONITORING_API_KEY ...`, `setx MONITORING_CLIENT_UPDATE_KEY ...`).
+
+### Автозапуск через Планировщик заданий (Windows, без прав администратора)
+
+Скрипты в `client/scheduler/` регистрируют две задачи от имени текущего пользователя:
+
+- `MonitoringAgent-OnLogon` — запуск `client_agent.exe` при входе пользователя;
+- `MonitoringAgent-Watchdog` — раз в 5 минут запускает агент, если процесс
+  `client_agent` не работает (подстраховка; основной перезапуск после
+  обновления делает сам агент).
+
+Установка на машине (скрипты и `client_agent.exe` в одном каталоге, иначе
+укажите `-AgentPath`):
+
+```powershell
+setx MONITORING_API_KEY "ключ_приёма"
+setx MONITORING_CLIENT_UPDATE_KEY "ключ_обновлений"
+powershell -NoProfile -ExecutionPolicy Bypass -File client\scheduler\install-tasks.ps1 -AgentPath "C:\monitoring\client_agent.exe"
+Get-ScheduledTask -TaskName "MonitoringAgent-*" | Format-Table TaskName, State
+```
+
+Удаление задач: `powershell -NoProfile -ExecutionPolicy Bypass -File client\scheduler\uninstall-tasks.ps1`.
+Переменные из `setx` попадают в новые процессы, поэтому после них перезапустите
+агент (или дождитесь сторожа).
+
 ## Секреты
 
 Ключи `api_key` (сервер и агент) и `client_update_key` (сервер) в файлах
