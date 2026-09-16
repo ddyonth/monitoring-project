@@ -67,7 +67,19 @@
     mode: "0644"
   notify: Restart monitoring server
 
-# Секрет передаётся сервису только через Environment= в unit-файле.
+# Секреты передаются сервису только через отдельный env-файл (0600),
+# который systemd читает через EnvironmentFile=. no_log — чтобы ключ не
+# попадал в вывод ansible-playbook при -v/--diff.
+- name: Render env file with secrets
+  ansible.builtin.template:
+    src: monitoring-server.env.j2
+    dest: "{{ deploy_dir }}/server/monitoring-server.env"
+    owner: "{{ monitoring_user }}"
+    group: "{{ monitoring_user }}"
+    mode: "0600"
+  no_log: true
+  notify: Restart monitoring server
+
 - name: Install systemd unit
   ansible.builtin.template:
     src: monitoring-server.service.j2

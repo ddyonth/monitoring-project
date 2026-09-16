@@ -11,10 +11,8 @@ Group={{ monitoring_user }}
 # но рабочий каталог задаём явно, чтобы относительные пути (db_path и т.п.)
 # указывали в каталог сервера.
 WorkingDirectory={{ deploy_dir }}/server
-Environment=MONITORING_API_KEY={{ monitoring_api_key }}
-{% if monitoring_client_update_key is defined and monitoring_client_update_key %}
-Environment=MONITORING_CLIENT_UPDATE_KEY={{ monitoring_client_update_key }}
-{% endif %}
+# Секреты — в отдельном файле 0600, чтобы не светились в `systemctl show`
+EnvironmentFile={{ deploy_dir }}/server/monitoring-server.env
 ExecStart={{ deploy_dir }}/venv/bin/python {{ deploy_dir }}/server/server_app.py
 Restart=on-failure
 RestartSec=5

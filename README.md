@@ -95,7 +95,7 @@ MONITORING_API_KEY=секрет python server/server_app.py
 
 Плейбук в `deploy/ansible/` разворачивает сервер как systemd-сервис
 `monitoring-server` в `/opt/monitoring` (venv, код `server/`, `config.json`
-без секретов, unit-файл с `WorkingDirectory` и `Environment=MONITORING_API_KEY`).
+без секретов, unit-файл с `WorkingDirectory` и `EnvironmentFile=` на отдельный env-файл 0600 с `MONITORING_API_KEY`).
 Control node — только Linux (например, WSL2 с Ubuntu); цель — любой
 apt-based хост (Debian/Ubuntu). Сейчас в инвентаре `localhost`, для VPS см.
 комментарий в `deploy/ansible/inventory/hosts.ini`.
