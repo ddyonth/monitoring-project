@@ -51,7 +51,7 @@ jobs:
       - name: Run tests
         env:
           MONITORING_TEST_DATABASE_URL: postgresql://monitoring:ci_password@localhost:5432/monitoring_test
-        run: python -m pytest server/tests -v
+        run: python -m pytest server/tests client/tests -v
 
   build-windows-agent:
     name: Build Windows agent (PyInstaller)
