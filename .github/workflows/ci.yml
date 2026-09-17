@@ -245,3 +245,73 @@ jobs:
             -F "version=${{ steps.version.outputs.version }}" \
             -F "file=@release/client_agent.exe" \
             "${MONITORING_SERVER_URL%/}/api/client-release"
+
+  # Автодеплой сервера: тот же ansible-playbook, что запускается руками
+  # (см. README «Деплой сервера»), но без --ask-vault-pass/--ask-become-pass:
+  #  - секреты приходят из GitHub Secrets через --extra-vars @файл (0600 в
+  #    $RUNNER_TEMP, удаляется в конце; у extra-vars приоритет выше vars_files,
+  #    а playbook.yml без vault.yml подключает пустой vault.ci.yml);
+  #  - sudo для раннера настроен NOPASSWD вне репозитория.
+  # Раннер тот же, что у публикации: деплой локальный (localhost в инвентаре),
+  # с GitHub-hosted раннера целевой хост недостижим. Защита от форков и от
+  # запуска не из master — как у publish-client-release.
+  deploy-server:
+    name: Deploy server (self-hosted, Ansible)
+    needs: [test]
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/master' &&
+      github.repository == 'ddyonth/monitoring-project'
+    runs-on: [self-hosted, linux, monitoring-publisher]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure Ansible is available
+        shell: bash
+        run: |
+          if command -v ansible-playbook >/dev/null 2>&1; then
+            echo "using $(command -v ansible-playbook)"
+          else
+            echo "ansible-playbook not found, installing for the runner user"
+            python3 -m pip install --user ansible
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.local/bin:$PATH"
+          fi
+          ansible-playbook --version | head -1
+
+      # Значения не подставляются в командную строку (не видны в ps):
+      # python читает их из окружения и пишет JSON в файл с правами 0600.
+      - name: Write secrets to a temporary extra-vars file
+        id: extra_vars
+        shell: bash
+        env:
+          MONITORING_API_KEY: ${{ secrets.MONITORING_API_KEY }}
+          MONITORING_CLIENT_UPDATE_KEY: ${{ secrets.MONITORING_CLIENT_UPDATE_KEY }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+        run: |
+          for name in MONITORING_API_KEY MONITORING_CLIENT_UPDATE_KEY POSTGRES_PASSWORD; do
+            test -n "${!name}" || { echo "secret $name is not set"; exit 1; }
+          done
+          file="$(mktemp --tmpdir="$RUNNER_TEMP" --suffix=.json ansible-extra-vars.XXXXXX)"
+          chmod 600 "$file"
+          python3 - "$file" <<'EOF'
+          import json, os, sys
+          with open(sys.argv[1], "w", encoding="utf-8") as f:
+              json.dump({
+                  "monitoring_api_key": os.environ["MONITORING_API_KEY"],
+                  "monitoring_client_update_key": os.environ["MONITORING_CLIENT_UPDATE_KEY"],
+                  "monitoring_postgres_password": os.environ["POSTGRES_PASSWORD"],
+              }, f)
+          EOF
+          echo "file=$file" >> "$GITHUB_OUTPUT"
+
+      - name: Run Ansible playbook
+        shell: bash
+        run: >-
+          ansible-playbook -i deploy/ansible/inventory/hosts.ini deploy/ansible/playbook.yml
+          --extra-vars "@${{ steps.extra_vars.outputs.file }}"
+
+      - name: Remove temporary extra-vars file
+        if: always()
+        shell: bash
+        run: rm -f "${{ steps.extra_vars.outputs.file }}"

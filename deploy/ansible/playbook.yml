@@ -3,8 +3,11 @@
   hosts: app_servers
   become: true
   vars_files:
-    # Секреты (зашифрованы ansible-vault, файл не в репозитории):
-    # см. group_vars/local/vault.yml.example
-    - group_vars/local/vault.yml
+    # Вложенный список = альтернативы: Ansible подключает первый существующий
+    # файл. Локально это vault.yml с секретами (зашифрован ansible-vault, не в
+    # репозитории, см. vault.yml.example); в CI его нет, берётся vault.ci.yml
+    # (пустой словарь), а секреты приходят через --extra-vars.
+    - - group_vars/local/vault.yml
+      - group_vars/local/vault.ci.yml
   roles:
     - monitoring_server

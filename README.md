@@ -298,6 +298,17 @@ docker compose run --rm tests
 
 ## Деплой сервера на Linux (Ansible)
 
+Деплой автоматический: при push в `master` (то есть после squash-merge PR)
+джоба `deploy-server` в `.github/workflows/ci.yml` после зелёных тестов
+запускает тот же плейбук на self-hosted раннере `monitoring-publisher`
+(деплой локальный, `localhost` в инвентаре). Секреты берутся из GitHub Secrets
+`MONITORING_API_KEY`, `MONITORING_CLIENT_UPDATE_KEY`, `POSTGRES_PASSWORD` и
+передаются через `--extra-vars @файл` (временный файл 0600, удаляется в конце
+джобы); `--ask-vault-pass` не нужен — без `vault.yml` плейбук подключает
+пустой `group_vars/local/vault.ci.yml`, а `--ask-become-pass` — потому что
+sudo для пользователя раннера настроен NOPASSWD вне репозитория. Если раннер
+недоступен, джоба ждёт его в очереди; ручной запуск ниже работает как прежде.
+
 Плейбук в `deploy/ansible/` разворачивает сервер через Docker Compose в
 `/opt/monitoring`: ставит Docker Engine и compose-plugin из официального
 apt-репозитория Docker, копирует туда `docker-compose.yml`, `server/Dockerfile`,
@@ -323,7 +334,8 @@ cp deploy/ansible/group_vars/local/vault.yml.example deploy/ansible/group_vars/l
 ansible-vault encrypt deploy/ansible/group_vars/local/vault.yml
 ```
 
-2. Запустить плейбук (нужен sudo на целевом хосте, поэтому `--ask-become-pass`):
+2. Запустить плейбук вручную (нужен sudo на целевом хосте, поэтому
+   `--ask-become-pass`; `vault.yml` подключается автоматически, если есть):
 
 ```bash
 ansible-playbook -i deploy/ansible/inventory/hosts.ini deploy/ansible/playbook.yml --ask-vault-pass --ask-become-pass
