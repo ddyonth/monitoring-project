@@ -2,15 +2,11 @@
 Самообновление агента: то, что проверяется без Windows и без exe.
 
 HTTP не мокается: в тестах поднимается настоящий локальный http.server с теми
-же двумя эндпоинтами, что у сервера мониторинга. Файловая логика замены
-проверяется на временном файле (exe_path передаётся явно, перезапуск отключён).
+же двумя эндпоинтами, что у сервера мониторинга (release_stub.FakeReleaseServer).
+Файловая логика замены проверяется на временном файле (exe_path передаётся явно, перезапуск отключён).
 """
 
-import hashlib
-import json
 import os
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import client_agent
@@ -26,73 +22,9 @@ from client_agent import (
     relaunch,
     server_base_url,
 )
-
-CLIENT_KEY = "TEST_CLIENT_KEY"
-
+from release_stub import CLIENT_KEY, FakeReleaseServer
 
 # ------------------------------------------------------------ локальный сервер
-
-class FakeReleaseServer:
-    """Минимальный сервер релизов: /api/client-release и /api/download/client-agent."""
-
-    def __init__(self):
-        self.release = None          # dict(version, sha256, size_bytes) или None
-        self.data = b""              # байты, которые отдаёт download
-        self.requests = []           # (path, client_key)
-        outer = self
-
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *a):  # тишина в выводе pytest
-                pass
-
-            def do_GET(self):
-                outer.requests.append((self.path, self.headers.get("X-Client-Key")))
-                if self.headers.get("X-Client-Key") != CLIENT_KEY:
-                    self.send_response(401)
-                    self.end_headers()
-                    return
-                if self.path == "/api/client-release":
-                    body = json.dumps({"client_release": outer.release}).encode()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(body)
-                elif self.path == "/api/download/client-agent":
-                    if outer.release is None:
-                        self.send_response(404)
-                        self.end_headers()
-                        return
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/octet-stream")
-                    self.end_headers()
-                    self.wfile.write(outer.data)
-                else:
-                    self.send_response(404)
-                    self.end_headers()
-
-        self.httpd = HTTPServer(("127.0.0.1", 0), Handler)
-        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
-
-    def start(self):
-        self.thread.start()
-        return self
-
-    def stop(self):
-        self.httpd.shutdown()
-        self.httpd.server_close()
-
-    @property
-    def base_url(self):
-        return f"http://127.0.0.1:{self.httpd.server_address[1]}"
-
-    def set_release(self, version, data: bytes, sha256=None):
-        self.data = data
-        self.release = {
-            "version": version,
-            "sha256": sha256 if sha256 is not None else hashlib.sha256(data).hexdigest(),
-            "size_bytes": len(data),
-        }
-
 
 @pytest.fixture
 def srv():
