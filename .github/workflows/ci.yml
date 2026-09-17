@@ -102,6 +102,9 @@ jobs:
   selfupdate-e2e-windows:
     name: Self-update end-to-end (windows-latest, real exe)
     runs-on: windows-latest
+    env:
+      # Консоль раннера — cp1252; вывод теста и агента (кириллица) должен быть UTF-8
+      PYTHONUTF8: "1"
     steps:
       - uses: actions/checkout@v4
 
