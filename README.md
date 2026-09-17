@@ -42,12 +42,14 @@
 pip install -r requirements.txt
 ```
 
-2. Настроить файлы:
+2. Настроить:
 
-- `client/config.json`
-- `server/config.json`
-
-Файлы `client/config.json` и `server/config.json` необязательны: при их отсутствии используются встроенные настройки из исходного кода. Если нужно изменить адрес сервера, ключи API, интервалы или другие параметры, создайте/отредактируйте эти файлы.
+- сервер — `server/config.json` (необязателен: без него используются встроенные
+  настройки из исходного кода; ключи задаются переменными окружения, см. «Секреты»);
+- агент — только переменные окружения, файла конфигурации у него нет:
+  `MONITORING_SERVER_URL` (адрес приёма, по умолчанию
+  `http://127.0.0.1:8000/api/ingest`), `MONITORING_API_KEY`,
+  `MONITORING_CLIENT_UPDATE_KEY`.
 
 3. Запустить сервер:
 
@@ -86,10 +88,10 @@ curl -sS --fail -X POST -H "X-API-Key: $MONITORING_API_KEY" \
 ```
 
 Агент читает метаданные `GET /api/client-release` и скачивает
-`GET /api/download/client-agent` с заголовком `X-Client-Key`
-(`client_update_key` в `client/config.json`, переопределяется переменной
-`MONITORING_CLIENT_UPDATE_KEY`). Базовый адрес сервера выводится из
-`server_ingest_url` (суффикс `/api/ingest` отбрасывается).
+`GET /api/download/client-agent` с заголовком `X-Client-Key` (переменная
+`MONITORING_CLIENT_UPDATE_KEY`). Базовый адрес сервера выводится из адреса
+приёма `MONITORING_SERVER_URL` (суффикс `/api/ingest` отбрасывается; без него
+обновления отключены).
 
 ### Самообновление
 
@@ -105,10 +107,12 @@ curl -sS --fail -X POST -H "X-API-Key: $MONITORING_API_KEY" \
 одну проверку/установку и выходит (код 0 — обновлять нечего или обновлено,
 1 — ошибка: sha256 не совпал, скачивание не удалось, запуск не из exe).
 
-Важно: упакованный onefile-exe **не читает `config.json` рядом с собой**
-(`__file__` в PyInstaller указывает во временный каталог), поэтому адрес сервера
-берётся из встроенного значения по умолчанию, а ключи — из переменных окружения
-пользователя (`setx MONITORING_API_KEY ...`, `setx MONITORING_CLIENT_UPDATE_KEY ...`).
+Агент настраивается только переменными окружения пользователя (`setx`):
+`MONITORING_SERVER_URL` — адрес приёма (по умолчанию
+`http://127.0.0.1:8000/api/ingest`, для VPS обязательно задать),
+`MONITORING_API_KEY`, `MONITORING_CLIENT_UPDATE_KEY`. Файла конфигурации у
+агента нет: в упакованном onefile-exe `__file__` указывает во временный каталог
+PyInstaller, поэтому файл рядом с exe всё равно не читался бы.
 
 ### Автотест самообновления в CI (windows-latest)
 
@@ -216,10 +220,10 @@ collaborators → **Require approval for all external contributors**. PR из ф
 
 ## Секреты
 
-Ключи `api_key` (сервер и агент) и `client_update_key` (сервер) в файлах
-`server/config.json` и `client/config.json` — это шаблоны с placeholder
-`CHANGE_ME_LOCAL_KEY`, они закоммичены в репозиторий и нужны только для того,
-чтобы приложение стартовало локально без настройки.
+Ключ `api_key` в `server/config.json` — шаблон с placeholder
+`CHANGE_ME_LOCAL_KEY`, он закоммичен в репозиторий и нужен только для того,
+чтобы сервер стартовал локально без настройки. У агента файла конфигурации
+нет: его настройки — встроенные значения по умолчанию плюс переменные окружения.
 
 Для реального использования ключи задаются через переменные окружения, а не
 правкой закоммиченного `config.json`:
@@ -227,11 +231,12 @@ collaborators → **Require approval for all external contributors**. PR из ф
 | Переменная | Кто читает | Что переопределяет |
 |---|---|---|
 | `MONITORING_API_KEY` | сервер и агент | `api_key` |
-| `MONITORING_CLIENT_UPDATE_KEY` | сервер | `client_update_key` |
+| `MONITORING_CLIENT_UPDATE_KEY` | сервер и агент | `client_update_key` |
+| `MONITORING_SERVER_URL` | агент | адрес приёма `server_ingest_url` |
 
-Приоритет: если переменная задана и не пустая, берётся она; иначе значение из
-`config.json`; если и там нет — встроенное значение по умолчанию из кода.
-Пример имён переменных — в `.env.example` (файл `.env` в `.gitignore`).
+Приоритет: если переменная задана и не пустая, берётся она; иначе (для сервера)
+значение из `config.json`; если и там нет — встроенное значение по умолчанию
+из кода. Пример имён переменных — в `.env.example` (файл `.env` в `.gitignore`).
 
 Пример запуска сервера с ключом из окружения:
 
@@ -293,6 +298,17 @@ docker compose run --rm tests
 
 ## Деплой сервера на Linux (Ansible)
 
+Деплой автоматический: при push в `master` (то есть после squash-merge PR)
+джоба `deploy-server` в `.github/workflows/ci.yml` после зелёных тестов
+запускает тот же плейбук на self-hosted раннере `monitoring-publisher`
+(деплой локальный, `localhost` в инвентаре). Секреты берутся из GitHub Secrets
+`MONITORING_API_KEY`, `MONITORING_CLIENT_UPDATE_KEY`, `POSTGRES_PASSWORD` и
+передаются через `--extra-vars @файл` (временный файл 0600, удаляется в конце
+джобы); `--ask-vault-pass` не нужен — без `vault.yml` плейбук подключает
+пустой `group_vars/local/vault.ci.yml`, а `--ask-become-pass` — потому что
+sudo для пользователя раннера настроен NOPASSWD вне репозитория. Если раннер
+недоступен, джоба ждёт его в очереди; ручной запуск ниже работает как прежде.
+
 Плейбук в `deploy/ansible/` разворачивает сервер через Docker Compose в
 `/opt/monitoring`: ставит Docker Engine и compose-plugin из официального
 apt-репозитория Docker, копирует туда `docker-compose.yml`, `server/Dockerfile`,
@@ -318,7 +334,8 @@ cp deploy/ansible/group_vars/local/vault.yml.example deploy/ansible/group_vars/l
 ansible-vault encrypt deploy/ansible/group_vars/local/vault.yml
 ```
 
-2. Запустить плейбук (нужен sudo на целевом хосте, поэтому `--ask-become-pass`):
+2. Запустить плейбук вручную (нужен sudo на целевом хосте, поэтому
+   `--ask-become-pass`; `vault.yml` подключается автоматически, если есть):
 
 ```bash
 ansible-playbook -i deploy/ansible/inventory/hosts.ini deploy/ansible/playbook.yml --ask-vault-pass --ask-become-pass
