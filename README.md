@@ -166,7 +166,7 @@ Get-ScheduledTask -TaskName "MonitoringAgent-*" | Format-Table TaskName, State
 - только событие `push` в ветку `master` этого репозитория;
 - только если в этом push менялось что-то в `client/**` (джоба
   `detect-client-changes`);
-- после зелёных `test` и `build-windows-agent`;
+- после зелёных `test`, `build-windows-agent` и `selfupdate-e2e-windows`;
 - никогда на `pull_request`; триггера `workflow_dispatch` у workflow нет.
 
 Джоба выполняется на self-hosted раннере с меткой `monitoring-publisher`,

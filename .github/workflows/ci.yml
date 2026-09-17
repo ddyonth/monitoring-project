@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [develop, master]
+    # feature/** — чтобы test/build/e2e давали сигнал до открытия PR;
+    # publish-client-release защищена своим условием (только push в master)
+    branches: [develop, master, 'feature/**']
   pull_request:
     branches: [develop, master]
 
@@ -199,7 +201,7 @@ jobs:
   # Settings -> Actions -> "Require approval for all external contributors".
   publish-client-release:
     name: Publish client release (self-hosted)
-    needs: [test, build-windows-agent, detect-client-changes]
+    needs: [test, build-windows-agent, selfupdate-e2e-windows, detect-client-changes]
     if: >-
       github.event_name == 'push' &&
       github.ref == 'refs/heads/master' &&
