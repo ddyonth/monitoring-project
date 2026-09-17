@@ -110,6 +110,27 @@ curl -sS --fail -X POST -H "X-API-Key: $MONITORING_API_KEY" \
 берётся из встроенного значения по умолчанию, а ключи — из переменных окружения
 пользователя (`setx MONITORING_API_KEY ...`, `setx MONITORING_CLIENT_UPDATE_KEY ...`).
 
+### Автотест самообновления в CI (windows-latest)
+
+Джоба `selfupdate-e2e-windows` в `.github/workflows/ci.yml` проверяет замену
+работающего exe на настоящей Windows, чтобы не делать это руками при каждом
+изменении `client_agent.py`. Она собирает две версии exe (текущую из
+`client/VERSION` и следующую, файл потом возвращается через `git checkout`),
+поднимает стаб сервера релизов на `127.0.0.1:8000` (адрес встроен в exe, см.
+выше) и запускает старую exe с `--apply-update-now`. Сценарии в
+`client/tests/test_selfupdate_e2e.py`:
+
+- обновление: код выхода 0, на месте старой exe лежит новая (sha256), старая
+  ушла в `.old`, новая версия перезапущена и сама сходила на сервер; повторный
+  запуск — `up_to_date` без скачивания, `.old` удалён при старте;
+- подмена: sha256 в метаданных не совпадает с байтами — код выхода 1, exe не
+  заменён, `.download` удалён.
+
+Джоба не зависит от `build-windows-agent`. Без переменных
+`MONITORING_SELFUPDATE_E2E_*` тест пропускается (так он ведёт себя в джобе
+`test`). Планировщик заданий (AtLogOn/сторож) в CI не проверяется: на раннере
+нет интерактивной сессии входа, это остаётся ручной проверкой.
+
 ### Автозапуск через Планировщик заданий (Windows, без прав администратора)
 
 Скрипты в `client/scheduler/` регистрируют две задачи от имени текущего пользователя:
@@ -145,7 +166,7 @@ Get-ScheduledTask -TaskName "MonitoringAgent-*" | Format-Table TaskName, State
 - только событие `push` в ветку `master` этого репозитория;
 - только если в этом push менялось что-то в `client/**` (джоба
   `detect-client-changes`);
-- после зелёных `test` и `build-windows-agent`;
+- после зелёных `test`, `build-windows-agent` и `selfupdate-e2e-windows`;
 - никогда на `pull_request`; триггера `workflow_dispatch` у workflow нет.
 
 Джоба выполняется на self-hosted раннере с меткой `monitoring-publisher`,
