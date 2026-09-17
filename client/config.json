@@ -1,8 +1,0 @@
-{
-  "server_ingest_url": "http://127.0.0.1:8000/api/ingest",
-  "api_key": "CHANGE_ME_LOCAL_KEY",
-  "client_update_key": "CHANGE_ME_CLIENT_KEY",
-  "db_path": "activity.db",
-  "interval_minutes": 10,
-  "batch_size": 300
-}

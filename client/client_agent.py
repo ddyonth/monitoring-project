@@ -1,6 +1,5 @@
 import os
 import sys
-import json
 import time
 import sqlite3
 import socket
@@ -21,13 +20,12 @@ import requests
 def _load_client_version() -> str:
     """
     Версия этого экземпляра агента — единственная база для сравнения с релизом
-    на сервере (config.json может переопределить только то, что агент СООБЩАЕТ
-    серверу, иначе обновление зациклится).
+    на сервере.
 
     Источник — файл client/VERSION. В упакованный exe версия попадает на этапе
     сборки: client_agent.spec генерирует модуль _version.py, который PyInstaller
     вшивает в бинарник, поэтому в рантайме с диска ничего не читается
-    (в onefile __file__ указывает во временный _MEIPASS, см. CONFIG_CANDIDATES).
+    (в onefile __file__ указывает во временный _MEIPASS, а не в каталог exe).
     При запуске из исходников читается сам файл VERSION рядом с этим .py.
     """
     if getattr(sys, "frozen", False):
@@ -58,29 +56,24 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "batch_size": 300,
 }
 
-CONFIG_CANDIDATES = [
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "client_config.json"),
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"),
-]
+# Настройка агента — только встроенные значения по умолчанию плюс переменные
+# окружения. Файл конфигурации не читается: в упакованном onefile-exe __file__
+# указывает во временный каталог PyInstaller, а не в каталог exe, поэтому
+# config.json рядом с exe в реальной поставке никогда не работал.
+CONFIG_ENV_OVERRIDES = {
+    "server_ingest_url": "MONITORING_SERVER_URL",
+    "api_key": "MONITORING_API_KEY",
+    "client_update_key": "MONITORING_CLIENT_UPDATE_KEY",
+}
+
 
 def load_config() -> Dict[str, Any]:
+    """DEFAULT_CONFIG, поверх — непустые переменные окружения из CONFIG_ENV_OVERRIDES."""
     cfg = DEFAULT_CONFIG.copy()
-    for path in CONFIG_CANDIDATES:
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                disk = json.load(f)
-            if isinstance(disk, dict):
-                cfg.update(disk)
-                break
-        except Exception:
-            pass
-    # Secrets from environment take priority over config.json
-    env_api_key = os.environ.get("MONITORING_API_KEY")
-    if env_api_key is not None and env_api_key.strip():
-        cfg["api_key"] = env_api_key
-    env_client_key = os.environ.get("MONITORING_CLIENT_UPDATE_KEY")
-    if env_client_key is not None and env_client_key.strip():
-        cfg["client_update_key"] = env_client_key
+    for key, env_name in CONFIG_ENV_OVERRIDES.items():
+        value = os.environ.get(env_name)
+        if value is not None and value.strip():
+            cfg[key] = value.strip()
     return cfg
 
 
@@ -956,7 +949,7 @@ def main() -> int:
     args = ap.parse_args()
 
     cfg = load_config()
-    client_version = str(cfg.get("client_version") or "").strip() or CLIENT_VERSION
+    client_version = CLIENT_VERSION
 
     cleanup_old_executable(current_executable_path())
 
@@ -998,7 +991,6 @@ def main() -> int:
                 break
 
             # Проверка обновления раз в цикл; в режиме --once не выполняется.
-            # Сравниваем с CLIENT_VERSION (версия этого exe), не с config.json.
             if check_and_apply_update(cfg, CLIENT_VERSION) == "updated":
                 # новый exe уже запущен; завершаемся корректно (finally ниже)
                 break

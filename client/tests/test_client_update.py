@@ -95,13 +95,51 @@ class TestServerBaseUrl:
 # ------------------------------------------------------------- конфиг
 
 class TestLoadConfig:
+    """Конфиг агента — только DEFAULT_CONFIG плюс переменные окружения; файла нет."""
+
+    @pytest.fixture(autouse=True)
+    def clean_env(self, monkeypatch):
+        for name in ("MONITORING_SERVER_URL", "MONITORING_API_KEY", "MONITORING_CLIENT_UPDATE_KEY"):
+            monkeypatch.delenv(name, raising=False)
+
     def test_client_update_key_default_and_env_override(self, monkeypatch):
-        monkeypatch.delenv("MONITORING_CLIENT_UPDATE_KEY", raising=False)
         assert load_config()["client_update_key"] == "CHANGE_ME_CLIENT_KEY"
         monkeypatch.setenv("MONITORING_CLIENT_UPDATE_KEY", "FROM_ENV")
         assert load_config()["client_update_key"] == "FROM_ENV"
         monkeypatch.setenv("MONITORING_CLIENT_UPDATE_KEY", "  ")
         assert load_config()["client_update_key"] == "CHANGE_ME_CLIENT_KEY"
+
+    def test_api_key_env_override(self, monkeypatch):
+        assert load_config()["api_key"] == "CHANGE_ME_LOCAL_KEY"
+        monkeypatch.setenv("MONITORING_API_KEY", "KEY_FROM_ENV")
+        assert load_config()["api_key"] == "KEY_FROM_ENV"
+
+    def test_server_url_default_and_env_override(self, monkeypatch):
+        assert load_config()["server_ingest_url"] == "http://127.0.0.1:8000/api/ingest"
+        monkeypatch.setenv("MONITORING_SERVER_URL", " http://10.0.0.5:8000/api/ingest ")
+        cfg = load_config()
+        assert cfg["server_ingest_url"] == "http://10.0.0.5:8000/api/ingest"   # пробелы обрезаются
+        assert server_base_url(cfg) == "http://10.0.0.5:8000"
+        monkeypatch.setenv("MONITORING_SERVER_URL", "")
+        assert load_config()["server_ingest_url"] == "http://127.0.0.1:8000/api/ingest"
+
+    def test_non_secret_defaults_are_not_env_configurable(self, monkeypatch):
+        # интервал, batch_size, db_path — только встроенные значения
+        cfg = load_config()
+        assert cfg["interval_minutes"] == 10 and cfg["batch_size"] == 300 and cfg["db_path"] == "activity.db"
+
+    def test_config_json_next_to_agent_is_ignored(self):
+        """Файл конфигурации не читается: exe его всё равно не видел (__file__ -> _MEIPASS)."""
+        for name in ("config.json", "client_config.json"):
+            path = Path(client_agent.__file__).with_name(name)
+            assert not path.exists(), f"{name} не должен лежать в репозитории"
+            path.write_text('{"server_ingest_url": "http://evil.example/api/ingest", "api_key": "X"}', encoding="utf-8")
+            try:
+                cfg = load_config()
+            finally:
+                path.unlink()
+            assert cfg["server_ingest_url"] == "http://127.0.0.1:8000/api/ingest"
+            assert cfg["api_key"] == "CHANGE_ME_LOCAL_KEY"
 
 
 # ------------------------------------------------------------- check_and_apply_update
