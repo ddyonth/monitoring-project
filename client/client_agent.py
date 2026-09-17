@@ -4,10 +4,12 @@ import json
 import time
 import sqlite3
 import socket
+import stat
 import getpass
 import argparse
 import hashlib
 import platform
+import subprocess
 import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -16,9 +18,41 @@ import psutil
 import requests
 # Config
 
+def _load_client_version() -> str:
+    """
+    Версия этого экземпляра агента — единственная база для сравнения с релизом
+    на сервере (config.json может переопределить только то, что агент СООБЩАЕТ
+    серверу, иначе обновление зациклится).
+
+    Источник — файл client/VERSION. В упакованный exe версия попадает на этапе
+    сборки: client_agent.spec генерирует модуль _version.py, который PyInstaller
+    вшивает в бинарник, поэтому в рантайме с диска ничего не читается
+    (в onefile __file__ указывает во временный _MEIPASS, см. CONFIG_CANDIDATES).
+    При запуске из исходников читается сам файл VERSION рядом с этим .py.
+    """
+    if getattr(sys, "frozen", False):
+        try:
+            from _version import CLIENT_VERSION as built  # сгенерирован spec-ом при сборке
+            return str(built).strip()
+        except Exception:
+            # exe собран без spec-а: версии нет, считаем её нулевой, чтобы
+            # первый же опубликованный релиз её заменил
+            return "0.0"
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION"), "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return "0.0"
+
+
+CLIENT_VERSION = _load_client_version()
+
+INGEST_SUFFIX = "/api/ingest"
+
 DEFAULT_CONFIG: Dict[str, Any] = {
     "server_ingest_url": "http://127.0.0.1:8000/api/ingest",
     "api_key": "CHANGE_ME_LOCAL_KEY",
+    "client_update_key": "CHANGE_ME_CLIENT_KEY",
     "db_path": "activity.db",
     "interval_minutes": 10,
     "batch_size": 300,
@@ -40,11 +74,27 @@ def load_config() -> Dict[str, Any]:
                 break
         except Exception:
             pass
-    # Secret from environment takes priority over config.json
+    # Secrets from environment take priority over config.json
     env_api_key = os.environ.get("MONITORING_API_KEY")
     if env_api_key is not None and env_api_key.strip():
         cfg["api_key"] = env_api_key
+    env_client_key = os.environ.get("MONITORING_CLIENT_UPDATE_KEY")
+    if env_client_key is not None and env_client_key.strip():
+        cfg["client_update_key"] = env_client_key
     return cfg
+
+
+def server_base_url(cfg: Dict[str, Any]) -> Optional[str]:
+    """
+    Базовый URL сервера выводится из server_ingest_url: единственный адрес
+    сервера в конфиге, отдельное поле могло бы разойтись с ним. Требуем
+    точный суффикс /api/ingest; иначе обновления отключены (None).
+    """
+    url = str(cfg.get("server_ingest_url") or "").strip().rstrip("/")
+    if not url.endswith(INGEST_SUFFIX):
+        return None
+    base = url[: -len(INGEST_SUFFIX)]
+    return base or None
 
 
 
@@ -672,12 +722,249 @@ def send_batch(server_url: str, api_key: str, rows: List[sqlite3.Row]) -> bool:
 
 
 
+# Self-update
+#
+# Контроль целостности релиза — только sha256, пересчитанный локально и
+# сверенный с метаданными /api/client-release, плюс ключ авторизации и (когда
+# сервер за HTTPS) TLS. Криптографической подписи релиза нет — осознанное решение.
+
+DOWNLOAD_SUFFIX = ".download"
+OLD_SUFFIX = ".old"
+
+
+def _log_update(msg: str) -> None:
+    print(f"[update] {msg}")
+
+
+def parse_version(v: Any) -> Optional[Tuple[int, ...]]:
+    """'1.10' -> (1, 10); что-то другое -> None. Сравниваем кортежи, не строки."""
+    s = str(v or "").strip()
+    if not s:
+        return None
+    parts = s.split(".")
+    if not all(p.isdigit() for p in parts):
+        return None
+    return tuple(int(p) for p in parts)
+
+
+def is_newer_version(server_version: Any, current_version: Any) -> Optional[bool]:
+    """True/False, или None если хотя бы одна из версий не разбирается."""
+    sv = parse_version(server_version)
+    cv = parse_version(current_version)
+    if sv is None or cv is None:
+        return None
+    return sv > cv
+
+
+def current_executable_path() -> Optional[str]:
+    """Путь к запущенному exe. Только для упакованного PyInstaller-агента:
+    при запуске из .py заменять sys.executable (python.exe) нельзя."""
+    if getattr(sys, "frozen", False):
+        return os.path.abspath(sys.executable)
+    return None
+
+
+def cleanup_old_executable(exe_path: Optional[str]) -> None:
+    """Удаляет <exe>.old от прошлого обновления (Windows не даёт удалить
+    работающий exe в момент замены, поэтому чистим при следующем старте)."""
+    if not exe_path:
+        return
+    old = exe_path + OLD_SUFFIX
+    try:
+        if os.path.exists(old):
+            os.remove(old)
+    except Exception as e:
+        _log_update(f"cannot remove {old}: {e}")
+
+
+def fetch_release_info(base_url: str, client_key: str, timeout: int = 30) -> Optional[Dict[str, Any]]:
+    """Метаданные последнего релиза или None (нет релизов / ошибка сети / не 200)."""
+    url = f"{base_url}/api/client-release"
+    try:
+        resp = requests.get(url, headers={"X-Client-Key": client_key}, timeout=timeout)
+    except Exception as e:
+        _log_update(f"GET {url} failed: {e}")
+        return None
+    if resp.status_code != 200:
+        _log_update(f"GET {url} -> {resp.status_code}")
+        return None
+    try:
+        rel = resp.json().get("client_release")
+    except Exception as e:
+        _log_update(f"bad JSON from {url}: {e}")
+        return None
+    if not isinstance(rel, dict):
+        return None
+    return rel
+
+
+def download_release(base_url: str, client_key: str, dest_path: str, timeout: int = 300) -> Optional[str]:
+    """Скачивает бинарник во временный файл dest_path; возвращает sha256 байт или None."""
+    url = f"{base_url}/api/download/client-agent"
+    h = hashlib.sha256()
+    try:
+        with requests.get(url, headers={"X-Client-Key": client_key}, timeout=timeout, stream=True) as resp:
+            if resp.status_code != 200:
+                _log_update(f"GET {url} -> {resp.status_code}")
+                return None
+            with open(dest_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=1024 * 256):
+                    if chunk:
+                        f.write(chunk)
+                        h.update(chunk)
+    except Exception as e:
+        _log_update(f"download failed: {e}")
+        _remove_quietly(dest_path)
+        return None
+    return h.hexdigest()
+
+
+def _remove_quietly(path: str) -> None:
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
+def apply_downloaded_release(exe_path: str, downloaded_path: str) -> None:
+    """Текущий exe -> exe.old, скачанный -> на место текущего (атомарно через os.replace)."""
+    # Скачанный файл создан с правами по умолчанию (без бита исполнения на
+    # Linux) — переносим права текущего exe, иначе новую версию нельзя запустить.
+    try:
+        os.chmod(downloaded_path, stat.S_IMODE(os.stat(exe_path).st_mode))
+    except Exception as e:
+        _log_update(f"cannot copy file mode to {downloaded_path}: {e}")
+    old_path = exe_path + OLD_SUFFIX
+    _remove_quietly(old_path)
+    os.replace(exe_path, old_path)
+    os.replace(downloaded_path, exe_path)
+
+
+def _child_environment() -> Dict[str, str]:
+    """
+    Окружение для перезапускаемого exe без служебных переменных PyInstaller
+    (_PYI_ARCHIVE_FILE, _PYI_APPLICATION_HOME_DIR, _PYI_PARENT_PROCESS_LEVEL,
+    _MEIPASS2 и т.п.). Унаследовав их, новый onefile-exe использует временный
+    каталог родителя, который удаляется при выходе старого процесса, и гибнет.
+    """
+    return {k: v for k, v in os.environ.items() if not k.startswith("_PYI_") and k != "_MEIPASS2"}
+
+
+def relaunch(exe_path: str, argv: List[str]) -> None:
+    """Запускает новый exe с теми же аргументами независимо от текущего процесса."""
+    kwargs: Dict[str, Any] = {
+        "cwd": os.path.dirname(exe_path) or None,
+        "env": _child_environment(),
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = (
+            getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        )
+    else:
+        kwargs["start_new_session"] = True
+    subprocess.Popen([exe_path] + list(argv), **kwargs)
+
+
+def check_and_apply_update(
+    cfg: Dict[str, Any],
+    current_version: str,
+    exe_path: Optional[str] = None,
+    do_relaunch: bool = True,
+    argv: Optional[List[str]] = None,
+    timeout: int = 30,
+) -> str:
+    """
+    Один цикл проверки/применения обновления. Возвращает:
+      "up_to_date"  — обновлять нечего (или сервер недоступен / нет релизов);
+      "updated"     — новый exe установлен (и, если do_relaunch, запущен);
+                      вызывающий код должен корректно завершиться;
+      "error"       — обновление есть, но применить не удалось (см. лог).
+    exe_path по умолчанию — путь запущенного упакованного exe; при запуске
+    из .py обновление не применяется.
+    """
+    base = server_base_url(cfg)
+    if not base:
+        _log_update("server_ingest_url does not end with /api/ingest, updates disabled")
+        return "up_to_date"
+    client_key = str(cfg.get("client_update_key") or "").strip()
+
+    rel = fetch_release_info(base, client_key, timeout=timeout)
+    if not rel:
+        return "up_to_date"
+
+    server_version = str(rel.get("version") or "").strip()
+    expected_sha = str(rel.get("sha256") or "").strip().lower()
+    newer = is_newer_version(server_version, current_version)
+    if newer is None:
+        _log_update(f"cannot compare versions: server={server_version!r}, current={current_version!r}, skip")
+        return "up_to_date"
+    if not newer:
+        _log_update(f"current {current_version} is up to date (server {server_version})")
+        return "up_to_date"
+    if not expected_sha:
+        _log_update(f"release {server_version} has no sha256, skip")
+        return "up_to_date"
+
+    exe = exe_path or current_executable_path()
+    if not exe:
+        _log_update(f"release {server_version} is newer than {current_version}, "
+                    "but self-update works only for the packaged exe (not running frozen)")
+        return "error"
+
+    tmp = exe + DOWNLOAD_SUFFIX
+    _log_update(f"downloading {server_version} to {tmp}")
+    actual_sha = download_release(base, client_key, tmp)
+    if not actual_sha:
+        _remove_quietly(tmp)
+        return "error"
+    if actual_sha != expected_sha:
+        _log_update(f"sha256 mismatch: expected {expected_sha}, got {actual_sha}; update rejected")
+        _remove_quietly(tmp)
+        return "error"
+
+    try:
+        apply_downloaded_release(exe, tmp)
+    except Exception as e:
+        _log_update(f"cannot replace executable: {e}")
+        _remove_quietly(tmp)
+        return "error"
+    _log_update(f"installed {server_version} to {exe}")
+
+    if do_relaunch:
+        args = list(sys.argv[1:] if argv is None else argv)
+        try:
+            relaunch(exe, args)
+            _log_update(f"relaunched {exe} {' '.join(args)}")
+        except Exception as e:
+            _log_update(f"relaunch failed: {e} (the new version will start on next launch)")
+    return "updated"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--once", action="store_true", help="Do one cycle and exit")
+    ap.add_argument("--once", action="store_true", help="Do one cycle and exit (no update check)")
+    ap.add_argument(
+        "--apply-update-now",
+        action="store_true",
+        help="Check the server for a newer agent release, apply it and exit (no collection)",
+    )
     args = ap.parse_args()
 
     cfg = load_config()
+    client_version = str(cfg.get("client_version") or "").strip() or CLIENT_VERSION
+
+    cleanup_old_executable(current_executable_path())
+
+    if args.apply_update_now:
+        result = check_and_apply_update(cfg, CLIENT_VERSION)
+        _log_update(f"result: {result}")
+        return 0 if result in ("up_to_date", "updated") else 1
+
     db_path = str(cfg.get("db_path") or "activity.db")
     server_url = str(cfg.get("server_ingest_url") or "").strip()
     api_key = str(cfg.get("api_key") or "").strip()
@@ -697,8 +984,6 @@ def main() -> int:
         t = threading.Thread(target=_wmi_subscribe, args=(conn, stop_evt), daemon=True)
         t.start()
 
-    client_version = str(cfg.get("client_version") or "").strip() or "1.2"
-
     try:
         while True:
             collect_slice(conn, client_version)
@@ -710,6 +995,12 @@ def main() -> int:
                     mark_sent(conn, [int(r["id"]) for r in rows])
 
             if args.once:
+                break
+
+            # Проверка обновления раз в цикл; в режиме --once не выполняется.
+            # Сравниваем с CLIENT_VERSION (версия этого exe), не с config.json.
+            if check_and_apply_update(cfg, CLIENT_VERSION) == "updated":
+                # новый exe уже запущен; завершаемся корректно (finally ниже)
                 break
             time.sleep(max(5, interval_min * 60))
     finally:

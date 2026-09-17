@@ -1,3 +1,5 @@
 # Зависимости только для разработки и тестов (в сборку не входят)
 pytest==9.1.1
 ruff==0.16.8
+# HTTP-клиент для fastapi.testclient.TestClient
+httpx==0.28.1

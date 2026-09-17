@@ -43,3 +43,6 @@ Thumbs.db
 
 # Ansible vault с реальными секретами
 deploy/ansible/group_vars/local/vault.yml
+
+# Генерируется client_agent.spec при сборке из client/VERSION
+client/_version.py
