@@ -17,3 +17,14 @@ monitoring_client_update_key: "CHANGE_ME"
 # Пароль пользователя Postgres в docker compose (POSTGRES_PASSWORD в .env).
 # Задаётся при первом создании базы: чтобы сменить потом — ALTER USER в базе.
 monitoring_postgres_password: "CHANGE_ME"
+
+# SMTP для email-уведомлений по алертам (SMTP_* в .env сервера) — ОПЦИОНАЛЬНО.
+# Можно не задавать вовсе или оставить пустыми: тогда сервер почту не шлёт,
+# а в журнале уведомлений будет статус failed «SMTP не настроен».
+# Нужны как минимум host и from; порт по умолчанию 587 (STARTTLS);
+# user/password — если SMTP-сервер требует авторизацию.
+monitoring_smtp_host: ""
+monitoring_smtp_port: ""
+monitoring_smtp_user: ""
+monitoring_smtp_password: ""
+monitoring_smtp_from: ""

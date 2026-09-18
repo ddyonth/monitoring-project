@@ -233,6 +233,8 @@ collaborators → **Require approval for all external contributors**. PR из ф
 | `MONITORING_API_KEY` | сервер и агент | `api_key` |
 | `MONITORING_CLIENT_UPDATE_KEY` | сервер и агент | `client_update_key` |
 | `MONITORING_SERVER_URL` | агент | адрес приёма `server_ingest_url` |
+| `MONITORING_DASHBOARD_URL` | сервер | `dashboard_base_url` (ссылка на дашборд в email-уведомлениях) |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM` | сервер | только окружение (email-уведомления по алертам, опционально) |
 
 Приоритет: если переменная задана и не пустая, берётся она; иначе (для сервера)
 значение из `config.json`; если и там нет — встроенное значение по умолчанию
@@ -333,6 +335,14 @@ cp deploy/ansible/group_vars/local/vault.yml.example deploy/ansible/group_vars/l
 # заполнить monitoring_api_key, monitoring_client_update_key, monitoring_postgres_password
 ansible-vault encrypt deploy/ansible/group_vars/local/vault.yml
 ```
+
+   Email-уведомления по алертам (опционально): в тот же локальный `vault.yml`
+   (он не в git, значения задаёте сами) дописать `monitoring_smtp_host`,
+   `monitoring_smtp_port`, `monitoring_smtp_user`, `monitoring_smtp_password`,
+   `monitoring_smtp_from` — имена и комментарии есть в `vault.yml.example`.
+   Роль рендерит их в `.env` как `SMTP_*`; без них сервер почту не шлёт.
+   Ссылка на дашборд в письме — `monitoring_dashboard_base_url` в
+   `deploy/ansible/group_vars/all.yml` (не секрет, по умолчанию пусто).
 
 2. Запустить плейбук вручную (нужен sudo на целевом хосте, поэтому
    `--ask-become-pass`; `vault.yml` подключается автоматически, если есть):

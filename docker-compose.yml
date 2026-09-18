@@ -38,6 +38,13 @@ services:
       MONITORING_API_KEY: ${MONITORING_API_KEY:?set MONITORING_API_KEY in host environment or .env}
       MONITORING_CLIENT_UPDATE_KEY: ${MONITORING_CLIENT_UPDATE_KEY:-}
       MONITORING_DATABASE_URL: postgresql://${POSTGRES_USER:-monitoring}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-monitoring}
+      # Email-уведомления по алертам (эпик 5), опционально: без SMTP_HOST/SMTP_FROM
+      # сервер почту не шлёт, а в журнал уведомлений пишет «SMTP не настроен»
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
     depends_on:
       postgres:
         condition: service_healthy
