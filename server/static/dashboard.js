@@ -4,7 +4,7 @@
 
 (function () {
   // Tab routing
-  const TABS = ["monitoring", "analytics", "settings"];
+  const TABS = ["monitoring", "analytics", "graphs", "settings"];
 
   function getActiveTab() {
     const btn = document.querySelector(".tabbtn.active");
@@ -27,6 +27,7 @@
     if (!tab) return;
     setActiveTab(tab);
     if (tab === "analytics") renderAnalytics();
+    if (tab === "graphs") renderGraphs();
     if (tab === "settings") renderSettings();
   });
 
@@ -1231,7 +1232,7 @@ function getProcType(name) {
     const reason = (a.reason || "").toString().toLowerCase();
     if (reason.includes("[combined]")) return "combined";
     if (m === "rarity") return "rarity";
-    if (m === "chain_rarity" || m === "chain_anomaly") return "chain";
+    if (m === "chain_rarity" || m === "chain_anomaly" || m === "chain_depth_anomaly" || m === "chain_fanout_anomaly") return "chain";
     if (m === "time_anomaly") return "time";
     return "resources";
   }
@@ -1282,6 +1283,8 @@ function getProcType(name) {
     }).join("");
   }
 
+  const LAST_ALERTS_BY_ID = {};
+
   async function loadAlerts() {
     const q = new URLSearchParams();
     q.set("since", isoSinceFromPeriod(byId("alPeriod")?.value || "7d"));
@@ -1299,6 +1302,7 @@ function getProcType(name) {
     if (ruleType) {
       items = items.filter(a => alertRuleGroup(a) === ruleType);
     }
+    for (const a of items) LAST_ALERTS_BY_ID[String(a.id)] = a;
 
     return `
       <div class="card" style="margin-bottom:12px;">
@@ -1330,6 +1334,7 @@ function getProcType(name) {
                   <td data-alert-status-cell="1" data-alert-id="${escapeHtml(String(a.id || ""))}">
                     <span data-alert-status-text="1">${escapeHtml(a.status || "")}</span>
                     <button data-alert-edit="1" data-alert-id="${escapeHtml(String(a.id || ""))}" style="margin-left:6px; padding:2px 8px; border-radius:999px; border:1px solid #ddd; cursor:pointer;">✏️</button>
+                    ${a.entity_type === "process_chain" ? `<button data-alert-graph="1" data-alert-id="${escapeHtml(String(a.id || ""))}" title="Посмотреть цепочку на вкладке «Графы»" style="margin-left:6px; padding:2px 8px; border-radius:999px; border:1px solid #ddd; cursor:pointer;">🌳 цепочка</button>` : ""}
                   </td>
 
                 </tr>
@@ -1348,6 +1353,13 @@ function getProcType(name) {
     root.dataset.alertEditorBound = "1";
 
     root.addEventListener("click", async (ev) => {
+      const graphBtn = ev.target && ev.target.closest ? ev.target.closest('button[data-alert-graph="1"]') : null;
+      if (graphBtn) {
+        const alertId = graphBtn.getAttribute("data-alert-id") || "";
+        if (alertId) await openGraphForAlert(alertId, LAST_ALERTS_BY_ID[alertId] || null);
+        return;
+      }
+
       const editBtn = ev.target && ev.target.closest ? ev.target.closest('button[data-alert-edit="1"]') : null;
       if (editBtn) {
         const alertId = editBtn.getAttribute("data-alert-id") || "";
@@ -1986,6 +1998,507 @@ function getProcType(name) {
     `;
   }
 
+  // ---------------------------------------------------------------------------
+  // Graphs tab (эпик 3, фазы B/C): дерево процессов от алерта или от текущего
+  // процесса поверх GET /api/analytics/process-tree. Раскладка — по уровням
+  // сверху вниз (предки над корнем, потомки под ним), карточки — div с
+  // absolute-позиционированием, рёбра — один SVG-слой, pan/zoom — CSS transform.
+  // ---------------------------------------------------------------------------
+
+  const GRAPH = {
+    lastPreset: null,     // чтобы повторное открытие вкладки восстанавливало выбор
+    alertsById: {},       // алерты из списка «Из алерта» (для подсветки без лишних запросов)
+    tree: null,
+    layout: null,
+    panzoom: null,
+  };
+
+  const GR_NODE_W = 200, GR_NODE_H = 62, GR_GAP_X = 26, GR_GAP_Y = 54;
+
+  function grAlertChainLabel(a) {
+    const proc = a.process_name || "";
+    if (a.parent_process_name) return `${a.parent_process_name} -> ${proc}`;
+    if ((a.metric || "") === "chain_fanout_anomaly") return `${proc} -> *`;
+    return proc;
+  }
+
+  function grNodeId(pid, startTime) {
+    return `${Number(pid) || 0}|${startTime || ""}`;
+  }
+
+  // Раскладка: потомки — по количеству листьев в поддереве (родитель по центру над
+  // детьми, порядок детей как пришёл с сервера), предки — цепочка над корнем.
+  function grLayout(tree) {
+    const byId = {};
+    for (const n of (tree.nodes || [])) byId[n.node_id] = n;
+    const rootId = tree.root.node_id;
+
+    const cx = {};
+    let cursor = 0;
+    function place(id) {
+      const n = byId[id];
+      const kids = (n.children_ids || []).filter(k => byId[k] && byId[k].level > n.level);
+      if (!kids.length) { cx[id] = cursor + 0.5; cursor += 1; return cx[id]; }
+      const xs = kids.map(place);
+      cx[id] = (xs[0] + xs[xs.length - 1]) / 2;
+      return cx[id];
+    }
+    place(rootId);
+    for (const aid of (tree.ancestor_ids || [])) cx[aid] = cx[rootId];
+
+    const levels = (tree.nodes || []).map(n => n.level);
+    const minLevel = Math.min(0, ...levels);
+    const maxLevel = Math.max(0, ...levels);
+    // сверху резервируем ряд под пометку «предки обрезаны», снизу — под «потомки обрезаны»
+    const topRows = tree.ancestors_truncated ? 1 : 0;
+
+    const pos = {};
+    for (const n of (tree.nodes || [])) {
+      if (cx[n.node_id] == null) continue;   // узел вне пути/поддерева (не должно случаться)
+      pos[n.node_id] = {
+        x: cx[n.node_id] * (GR_NODE_W + GR_GAP_X) - GR_NODE_W / 2 + GR_GAP_X,
+        y: (n.level - minLevel + topRows) * (GR_NODE_H + GR_GAP_Y) + GR_GAP_Y / 2,
+      };
+    }
+    const rows = (maxLevel - minLevel + 1) + topRows + (tree.descendants_truncated ? 1 : 0);
+    return {
+      byId, pos, rootId, minLevel, maxLevel, topRows,
+      width: cursor * (GR_NODE_W + GR_GAP_X) + GR_GAP_X,
+      height: rows * (GR_NODE_H + GR_GAP_Y) + GR_GAP_Y,
+    };
+  }
+
+  function grRenderTree(canvas, tree, layout) {
+    canvas.innerHTML = "";
+    canvas.style.width = `${layout.width}px`;
+    canvas.style.height = `${layout.height}px`;
+
+    // рёбра
+    const svgNS = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(svgNS, "svg");
+    svg.setAttribute("class", "grEdges");
+    svg.setAttribute("width", String(layout.width));
+    svg.setAttribute("height", String(layout.height));
+    for (const n of (tree.nodes || [])) {
+      const p = n.parent_id ? layout.pos[n.parent_id] : null;
+      const c = layout.pos[n.node_id];
+      if (!p || !c) continue;
+      const line = document.createElementNS(svgNS, "line");
+      line.setAttribute("x1", String(p.x + GR_NODE_W / 2));
+      line.setAttribute("y1", String(p.y + GR_NODE_H));
+      line.setAttribute("x2", String(c.x + GR_NODE_W / 2));
+      line.setAttribute("y2", String(c.y));
+      svg.appendChild(line);
+    }
+    canvas.appendChild(svg);
+
+    // карточки
+    for (const n of (tree.nodes || [])) {
+      const p = layout.pos[n.node_id];
+      if (!p) continue;
+      const el = document.createElement("div");
+      el.className = "grNode" + (n.is_root ? " grRoot" : "");
+      el.dataset.nodeId = n.node_id;
+      el.style.left = `${p.x}px`;
+      el.style.top = `${p.y}px`;
+      el.style.width = `${GR_NODE_W}px`;
+      el.style.height = `${GR_NODE_H}px`;
+      const user = normUsername(n.user_name || "");
+      const lvl = n.level === 0 ? "корень" : (n.level < 0 ? `предок ${-n.level}` : `уровень ${n.level}`);
+      el.title = `${n.process_name || "unknown"}\npid ${n.pid ?? "—"}, ppid ${n.ppid ?? "—"}\n${lvl}\nстарт: ${fmtLocalTs(n.start_time || "")}` +
+        (n.end_time ? `\nконец: ${fmtLocalTs(n.end_time)}` : "") + (n.exe_path ? `\n${n.exe_path}` : "");
+      el.innerHTML = `
+        <div class="grName">${escapeHtml(n.process_name || "unknown")}</div>
+        <div class="grMeta">pid ${escapeHtml(n.pid ?? "—")}${user ? " · " + escapeHtml(user) : ""}</div>
+        <div class="grMeta">${escapeHtml(fmtLocalTs(n.start_time || ""))}${n.end_time ? " → " + escapeHtml(fmtLocalTs(n.end_time)) : ""}</div>`;
+      canvas.appendChild(el);
+    }
+
+    // пометки об обрезке по границам дерева
+    const maxDepth = tree.max_depth;
+    if (tree.ancestors_truncated) {
+      const top = layout.pos[(tree.ancestor_ids || [])[tree.ancestor_ids.length - 1]] || layout.pos[layout.rootId];
+      const m = document.createElement("div");
+      m.className = "grTrunc";
+      m.style.left = `${top.x}px`;
+      m.style.top = `${top.y - GR_NODE_H - GR_GAP_Y}px`;
+      m.style.width = `${GR_NODE_W}px`;
+      m.textContent = `⋯ дальше не показано: глубина предков превышает лимит (${maxDepth})`;
+      canvas.appendChild(m);
+    }
+    if (tree.descendants_truncated) {
+      const m = document.createElement("div");
+      m.className = "grTrunc";
+      m.style.left = `${GR_GAP_X}px`;
+      m.style.top = `${(layout.maxLevel - layout.minLevel + layout.topRows + 1) * (GR_NODE_H + GR_GAP_Y) + GR_GAP_Y / 2}px`;
+      m.style.width = `${Math.max(GR_NODE_W, layout.width - 2 * GR_GAP_X)}px`;
+      m.textContent = `⋯ дальше не показано: глубина потомков превышает лимит (${maxDepth} уровней)`;
+      canvas.appendChild(m);
+    }
+  }
+
+  // Какие узлы подсвечивать для алерта: якорь = сессия из самого алерта;
+  // chain_fanout_anomaly (привязан к родителю) — плюс все его дети («веер»);
+  // chain_depth_anomaly — плюс весь путь предков (аномалия в длине цепочки);
+  // прочие process_chain (chain_rarity) — плюс прямой родитель (ребро parent -> child).
+  function grHighlightSetForAlert(alert, layout) {
+    const anchor = grNodeId(alert.pid, alert.start_time);
+    const ids = new Set();
+    const a = layout.byId[anchor];
+    if (!a) return { anchor, ids };
+    ids.add(anchor);
+    const m = alert.metric || "";
+    if (m === "chain_fanout_anomaly") {
+      for (const c of (a.children_ids || [])) if (layout.byId[c]) ids.add(c);
+    } else if (m === "chain_depth_anomaly") {
+      let p = a.parent_id;
+      while (p && layout.byId[p]) { ids.add(p); p = layout.byId[p].parent_id; }
+    } else if (alert.entity_type === "process_chain" && a.parent_id && layout.byId[a.parent_id]) {
+      ids.add(a.parent_id);
+    }
+    return { anchor, ids };
+  }
+
+  function grApplyAlerts(canvas, layout, alerts) {
+    canvas.querySelectorAll(".grNode.grAlert").forEach(el => el.classList.remove("grAlert"));
+    canvas.querySelectorAll(".grLabel").forEach(el => el.remove());
+    const labelsByAnchor = {};
+    for (const al of (alerts || [])) {
+      const { anchor, ids } = grHighlightSetForAlert(al, layout);
+      for (const id of ids) {
+        const el = canvas.querySelector(`.grNode[data-node-id="${CSS.escape(id)}"]`);
+        if (el) el.classList.add("grAlert");
+      }
+      if (layout.byId[anchor]) (labelsByAnchor[anchor] = labelsByAnchor[anchor] || []).push(al);
+    }
+    for (const anchor of Object.keys(labelsByAnchor)) {
+      const p = layout.pos[anchor];
+      if (!p) continue;
+      const lbl = document.createElement("div");
+      lbl.className = "grLabel";
+      lbl.style.left = `${p.x + GR_NODE_W + 8}px`;
+      lbl.style.top = `${p.y}px`;
+      lbl.textContent = labelsByAnchor[anchor].map(al => `[${al.severity || ""}] ${al.reason || al.metric || ""}`).join("\n");
+      canvas.appendChild(lbl);
+    }
+  }
+
+  function grSoftNote(canvas, layout, nodeId, text) {
+    canvas.querySelectorAll(".grLabel.soft").forEach(el => el.remove());
+    const p = layout.pos[nodeId];
+    if (!p) return;
+    const lbl = document.createElement("div");
+    lbl.className = "grLabel soft";
+    lbl.style.left = `${p.x + GR_NODE_W + 8}px`;
+    lbl.style.top = `${p.y}px`;
+    lbl.textContent = text;
+    canvas.appendChild(lbl);
+  }
+
+  // Pan/zoom на CSS transform: drag мышью, масштаб колесом вокруг курсора.
+  function grWirePanZoom(viewport, canvas) {
+    const st = { scale: 1, tx: 0, ty: 0, dragging: false, sx: 0, sy: 0, moved: 0 };
+    const apply = () => { canvas.style.transform = `translate(${st.tx}px, ${st.ty}px) scale(${st.scale})`; };
+    viewport.addEventListener("wheel", (e) => {
+      e.preventDefault();
+      const r = viewport.getBoundingClientRect();
+      const mx = e.clientX - r.left, my = e.clientY - r.top;
+      const f = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+      const ns = Math.min(3, Math.max(0.15, st.scale * f));
+      st.tx = mx - (mx - st.tx) * (ns / st.scale);
+      st.ty = my - (my - st.ty) * (ns / st.scale);
+      st.scale = ns;
+      apply();
+    }, { passive: false });
+    viewport.addEventListener("mousedown", (e) => {
+      if (e.button !== 0) return;
+      st.dragging = true; st.moved = 0;
+      st.sx = e.clientX - st.tx; st.sy = e.clientY - st.ty;
+      viewport.classList.add("dragging");
+      e.preventDefault();
+    });
+    window.addEventListener("mousemove", (e) => {
+      if (!st.dragging) return;
+      const nx = e.clientX - st.sx, ny = e.clientY - st.sy;
+      st.moved += Math.abs(nx - st.tx) + Math.abs(ny - st.ty);
+      st.tx = nx; st.ty = ny;
+      apply();
+    });
+    window.addEventListener("mouseup", () => { st.dragging = false; viewport.classList.remove("dragging"); });
+    return {
+      state: st,
+      set(tx, ty, scale) { st.tx = tx; st.ty = ty; st.scale = scale; apply(); },
+      wasDrag() { return st.moved > 4; },
+    };
+  }
+
+  async function renderGraphs(preset) {
+    const root = byId("graphsRoot");
+    if (!root) return;
+    if (!preset) preset = GRAPH.lastPreset;
+    GRAPH.lastPreset = preset || null;
+
+    root.innerHTML = `
+      <h2 style="margin:0 0 10px 0;">Графы цепочек процессов</h2>
+      <div class="card" style="margin-bottom:12px;">
+        <div class="badge" style="display:flex; flex-wrap:wrap; gap:10px; align-items:center;">
+          <span class="muted">Источник корня:</span>
+          <label class="chk"><input type="radio" name="grMode" value="alert" checked> Из алерта</label>
+          <label class="chk"><input type="radio" name="grMode" value="process"> Текущий процесс</label>
+          <span id="grModeAlert" style="display:inline-flex; gap:8px; align-items:center;">
+            <select id="grAlertSel" style="max-width:640px;"><option value="">(загрузка алертов...)</option></select>
+            <button id="grAlertsReload" style="padding:6px 10px; border-radius:999px; border:1px solid #ddd; cursor:pointer;">Обновить список</button>
+          </span>
+          <span id="grModeProc" style="display:none; gap:8px; align-items:center;">
+            <label class="muted">Машина:</label>
+            <select id="grMachineSel"><option value="">(загрузка...)</option></select>
+            <label class="muted">Процесс:</label>
+            <select id="grProcSel" style="max-width:520px;"><option value="">(выберите машину)</option></select>
+          </span>
+          <span id="grStatus" class="muted"></span>
+        </div>
+        <div class="grLegend">
+          <span>Предки — сверху, потомки — снизу, корень выделен жирной рамкой.</span>
+          <span>Перетаскивание — мышью, масштаб — колесом.</span>
+          <span>Клик по узлу — проверить, есть ли по нему алерты.</span>
+          <button id="grFit" style="padding:2px 8px; border-radius:999px; border:1px solid #ddd; cursor:pointer;">Сбросить вид</button>
+        </div>
+        <div id="grInfo" class="muted" style="margin:4px 0 8px 0; white-space:pre-wrap;"></div>
+        <div id="grViewport" class="grViewport"><div id="grCanvas" class="grCanvas"></div></div>
+      </div>
+    `;
+
+    const status = byId("grStatus");
+    const info = byId("grInfo");
+    const viewport = byId("grViewport");
+    const canvas = byId("grCanvas");
+    const alertSel = byId("grAlertSel");
+    const machineSel = byId("grMachineSel");
+    const procSel = byId("grProcSel");
+    const modeAlert = byId("grModeAlert");
+    const modeProc = byId("grModeProc");
+
+    GRAPH.panzoom = grWirePanZoom(viewport, canvas);
+    GRAPH.tree = null;
+    GRAPH.layout = null;
+
+    let latestCache = null;   // ответ /api/latest для режима «Текущий процесс»
+
+    function currentMode() {
+      const r = root.querySelector('input[name="grMode"]:checked');
+      return r ? r.value : "alert";
+    }
+
+    function showMode(mode) {
+      modeAlert.style.display = mode === "alert" ? "inline-flex" : "none";
+      modeProc.style.display = mode === "process" ? "inline-flex" : "none";
+    }
+
+    function fitView() {
+      if (!GRAPH.layout) return;
+      const rp = GRAPH.layout.pos[GRAPH.layout.rootId];
+      const vw = viewport.clientWidth || 800;
+      const scale = 1;
+      const tx = Math.round(vw / 2 - (rp.x + GR_NODE_W / 2) * scale);
+      GRAPH.panzoom.set(tx, 16, scale);
+    }
+
+    function describeTree(tree) {
+      const n = (tree.nodes || []).length;
+      const anc = (tree.ancestor_ids || []).length;
+      const desc = n - anc - 1;
+      const parts = [`Машина ${tree.root.machine_name}: корень pid ${tree.root.pid} (старт ${fmtLocalTs(tree.root.start_time)}), предков: ${anc}, потомков: ${desc}, лимит глубины: ${tree.max_depth}.`];
+      if (tree.ancestors_truncated) parts.push("⚠ Путь предков обрезан: дальше не показано, глубина превышает лимит.");
+      if (tree.descendants_truncated) parts.push("⚠ Поддерево потомков обрезано: дальше не показано, глубина превышает лимит.");
+      return parts.join("\n");
+    }
+
+    async function buildTree(params, alertsToHighlight, note) {
+      status.textContent = "Строю дерево...";
+      info.textContent = "";
+      canvas.innerHTML = "";
+      try {
+        const q = new URLSearchParams();
+        for (const k of Object.keys(params)) q.set(k, String(params[k]));
+        const tree = await apiGetJson(`/api/analytics/process-tree?${q.toString()}`);
+        GRAPH.tree = tree;
+        GRAPH.layout = grLayout(tree);
+        grRenderTree(canvas, tree, GRAPH.layout);
+        fitView();
+        let text = describeTree(tree);
+        if (alertsToHighlight && alertsToHighlight.length) {
+          grApplyAlerts(canvas, GRAPH.layout, alertsToHighlight);
+          text += "\n" + alertsToHighlight.map(a => `Алерт #${a.id} (${a.metric}, ${a.severity}): ${a.reason || ""}`).join("\n");
+        }
+        if (note) text += "\n" + note;
+        info.textContent = text;
+        status.textContent = "";
+      } catch (e) {
+        status.textContent = "";
+        info.innerHTML = `<span class="error">Ошибка построения дерева: ${escapeHtml(e.message || String(e))}</span>`;
+      }
+    }
+
+    async function loadAlertsList(selectedId) {
+      const data = await apiGetJson("/api/alerts?entity_type=process_chain&limit=50&offset=0");
+      const items = data.items || [];
+      GRAPH.alertsById = {};
+      for (const a of items) GRAPH.alertsById[String(a.id)] = a;
+      alertSel.innerHTML = `<option value="">(выберите алерт по цепочке)</option>` + items.map(a => {
+        const label = `${fmtLocalTs(a.created_at || a.sample_time || "")} · ${a.machine_name || ""} · ${grAlertChainLabel(a)} · ${a.severity || ""}`;
+        return `<option value="${escapeHtml(String(a.id))}">${escapeHtml(label)}</option>`;
+      }).join("");
+      if (selectedId != null && !GRAPH.alertsById[String(selectedId)]) {
+        // алерт пришёл из таблицы аналитики, но не попал в последние 50 — добавляем отдельной опцией
+        const a = (preset && preset.alert) ? preset.alert : null;
+        const label = a ? `${fmtLocalTs(a.created_at || "")} · ${a.machine_name || ""} · ${grAlertChainLabel(a)} · ${a.severity || ""}` : `алерт #${selectedId}`;
+        alertSel.insertAdjacentHTML("beforeend", `<option value="${escapeHtml(String(selectedId))}">${escapeHtml(label)}</option>`);
+        if (a) GRAPH.alertsById[String(selectedId)] = a;
+      }
+      if (selectedId != null) alertSel.value = String(selectedId);
+    }
+
+    async function buildFromAlert(alertId) {
+      const a = GRAPH.alertsById[String(alertId)] || null;
+      await buildTree({ alert_id: alertId }, a ? [a] : []);
+    }
+
+    async function loadMachines(selected) {
+      const m = await apiGetJson("/api/machines");
+      const items = (m && m.items) ? m.items : [];
+      machineSel.innerHTML = `<option value="">(выберите машину)</option>` + items.map(x => {
+        const name = x.machine_name || "";
+        const alias = x.alias ? ` (${x.alias})` : "";
+        return `<option value="${escapeHtml(name)}">${escapeHtml(name + alias)}</option>`;
+      }).join("");
+      if (selected) machineSel.value = selected;
+    }
+
+    async function loadProcesses(machine, selectedValue) {
+      procSel.innerHTML = `<option value="">(загрузка...)</option>`;
+      if (!latestCache) latestCache = await apiGetJson("/api/latest");
+      const mrow = (latestCache.latest || []).find(x => (x.machine_name || "") === machine);
+      const running = (mrow && mrow.running_main) ? mrow.running_main.slice() : [];
+      running.sort((a, b) => norm(a.process_name).localeCompare(norm(b.process_name), "ru") || (Number(a.pid) || 0) - (Number(b.pid) || 0));
+      procSel.innerHTML = `<option value="">(выберите процесс: запущенных ${running.length})</option>` + running.map(ev => {
+        const val = grNodeId(ev.pid, ev.start_time);
+        const user = normUsername(ev.user_name || "");
+        const label = `${ev.process_name || "unknown"} (pid ${ev.pid ?? "—"}${user ? ", " + user : ""}, с ${fmtLocalTs(ev.start_time || "")})`;
+        return `<option value="${escapeHtml(val)}">${escapeHtml(label)}</option>`;
+      }).join("");
+      if (selectedValue) {
+        if (!running.some(ev => grNodeId(ev.pid, ev.start_time) === selectedValue)) {
+          // процесс из карточки уже не в «запущенных» — всё равно даём построить дерево по его координатам
+          procSel.insertAdjacentHTML("beforeend", `<option value="${escapeHtml(selectedValue)}">${escapeHtml("pid " + selectedValue.replace("|", ", старт "))} (не в текущем срезе)</option>`);
+        }
+        procSel.value = selectedValue;
+      }
+    }
+
+    async function buildFromProcess() {
+      const machine = machineSel.value || "";
+      const val = procSel.value || "";
+      if (!machine || !val) return;
+      const i = val.indexOf("|");
+      const pid = val.slice(0, i), start = val.slice(i + 1);
+      await buildTree({ machine_name: machine, pid, start_time: start }, [],
+        "Автоподсветки нет: кликните по узлу, чтобы проверить алерты по нему.");
+    }
+
+    // клик по узлу: точечный запрос «есть ли алерт по этой сессии»
+    canvas.addEventListener("click", async (e) => {
+      if (GRAPH.panzoom.wasDrag()) return;
+      const el = e.target && e.target.closest ? e.target.closest(".grNode") : null;
+      if (!el || !GRAPH.tree || !GRAPH.layout) return;
+      const nodeId = el.dataset.nodeId || "";
+      const n = GRAPH.layout.byId[nodeId];
+      if (!n) return;
+      canvas.querySelectorAll(".grNode.grSelected").forEach(x => x.classList.remove("grSelected"));
+      el.classList.add("grSelected");
+      status.textContent = "Проверяю алерты по узлу...";
+      try {
+        const q = new URLSearchParams();
+        q.set("machine", GRAPH.tree.root.machine_name);
+        q.set("pid", String(n.pid ?? 0));
+        q.set("start_time", n.start_time || "");
+        q.set("limit", "50");
+        const data = await apiGetJson(`/api/alerts?${q.toString()}`);
+        const items = data.items || [];
+        status.textContent = "";
+        const head = `Узел ${n.process_name || "unknown"} (pid ${n.pid ?? "—"}, старт ${fmtLocalTs(n.start_time || "")}): `;
+        if (items.length) {
+          grApplyAlerts(canvas, GRAPH.layout, items);
+          info.textContent = describeTree(GRAPH.tree) + "\n" + head + `алертов: ${items.length}\n` +
+            items.map(a => `• #${a.id} ${a.metric} [${a.severity}] ${fmtLocalTs(a.created_at || "")}: ${a.reason || ""}`).join("\n");
+        } else {
+          grSoftNote(canvas, GRAPH.layout, nodeId, "алертов по этому узлу нет");
+          info.textContent = describeTree(GRAPH.tree) + "\n" + head + "алертов по этому узлу нет.";
+        }
+      } catch (err) {
+        status.textContent = "";
+        info.innerHTML = `<span class="error">Ошибка запроса алертов: ${escapeHtml(err.message || String(err))}</span>`;
+      }
+    });
+
+    root.querySelectorAll('input[name="grMode"]').forEach(r => r.addEventListener("change", async () => {
+      const mode = currentMode();
+      showMode(mode);
+      canvas.innerHTML = "";
+      info.textContent = "";
+      GRAPH.tree = null; GRAPH.layout = null;
+      try {
+        // списки грузим лениво при первом переключении в режим
+        if (mode === "process" && machineSel.options.length <= 1) await loadMachines("");
+        if (mode === "alert" && alertSel.options.length <= 1) await loadAlertsList(null);
+      } catch (e) {
+        info.innerHTML = `<span class="error">${escapeHtml(e.message || String(e))}</span>`;
+      }
+    }));
+    alertSel.addEventListener("change", () => { if (alertSel.value) buildFromAlert(alertSel.value); });
+    byId("grAlertsReload").addEventListener("click", async () => {
+      try { await loadAlertsList(alertSel.value || null); }
+      catch (e) { info.innerHTML = `<span class="error">${escapeHtml(e.message || String(e))}</span>`; }
+    });
+    machineSel.addEventListener("change", async () => {
+      if (!machineSel.value) { procSel.innerHTML = `<option value="">(выберите машину)</option>`; return; }
+      try { await loadProcesses(machineSel.value); }
+      catch (e) { info.innerHTML = `<span class="error">${escapeHtml(e.message || String(e))}</span>`; }
+    });
+    procSel.addEventListener("change", buildFromProcess);
+    byId("grFit").addEventListener("click", fitView);
+
+    // стартовое состояние (в т.ч. переход с других вкладок)
+    try {
+      const mode = (preset && preset.mode) ? preset.mode : "alert";
+      const r = root.querySelector(`input[name="grMode"][value="${mode}"]`);
+      if (r) r.checked = true;
+      showMode(mode);
+      if (mode === "alert") {
+        await loadAlertsList(preset && preset.alertId != null ? preset.alertId : null);
+        if (preset && preset.alertId != null) await buildFromAlert(preset.alertId);
+      } else {
+        await loadMachines(preset ? preset.machine : "");
+        if (preset && preset.machine) {
+          await loadProcesses(preset.machine, preset.pid != null ? grNodeId(preset.pid, preset.start_time) : "");
+          if (preset.pid != null) await buildFromProcess();
+        }
+      }
+    } catch (e) {
+      info.innerHTML = `<span class="error">${escapeHtml(e.message || String(e))}</span>`;
+    }
+  }
+
+  // Точки входа с других вкладок (фаза C)
+  async function openGraphForAlert(alertId, alertObj) {
+    setActiveTab("graphs");
+    await renderGraphs({ mode: "alert", alertId, alert: alertObj || null });
+  }
+
+  async function openGraphForProcess(machineName, pid, startTime) {
+    setActiveTab("graphs");
+    await renderGraphs({ mode: "process", machine: machineName, pid, start_time: startTime });
+  }
+
   // prevent auto-refresh from spamming while not on Monitoring (safe)
   (function hookTabs() {
     if (typeof fetchLatest === "function") {
@@ -2001,4 +2514,7 @@ function getProcType(name) {
   window.fetchLatest = fetchLatest;
   window.renderAnalytics = renderAnalytics;
   window.renderSettings = renderSettings;
+  window.renderGraphs = renderGraphs;
+  window.openGraphForAlert = openGraphForAlert;
+  window.openGraphForProcess = openGraphForProcess;
 })();
