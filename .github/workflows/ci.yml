@@ -95,34 +95,44 @@ jobs:
   # только Linux-зависимости (client/requirements-linux.txt, без pywin32-ctypes
   # и pefile). Артефакт публикуется в CI, в релизы сервера не попадает —
   # publish-client-release по-прежнему только про Windows exe.
+  #
+  # Сборка идёт внутри Docker-контейнера python:3.11-buster (Debian 10,
+  # glibc 2.28, Python 3.11, binutils/objdump для PyInstaller уже есть): бинарник,
+  # собранный прямо на ubuntu-latest, требует GLIBC_2.38 и не стартует на
+  # Astra Linux 1.7 (glibc 2.28). Библиотеки в onefile-бинарнике линкуются под
+  # glibc сборочного окружения, поэтому старая база даёт совместимость «снизу
+  # вверх»: Astra 1.7 (2.28), ALT Workstation 11.1 (2.38), Ubuntu — как manylinux.
   build-linux-agent:
-    name: Build Linux agent (PyInstaller)
+    name: Build Linux agent (PyInstaller, glibc 2.28)
     needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-          cache-dependency-path: client/requirements-linux.txt
-
-      - name: Install dependencies
+      # Репозиторий монтируется в контейнер; dist/build — как у Windows-сборки.
+      # --root-user-action=ignore только глушит предупреждение pip внутри контейнера.
+      - name: Build client_agent in python:3.11-buster (glibc 2.28)
         run: |
-          python -m pip install --upgrade pip
-          pip install -r client/requirements-linux.txt
+          docker run --rm -v "$PWD:/src" -w /src python:3.11-buster bash -ec '
+            echo "build env: $(ldd --version | head -1) / $(python --version)"
+            python -m pip install --quiet --root-user-action=ignore --upgrade pip
+            pip install --quiet --root-user-action=ignore -r client/requirements-linux.txt
+            pyinstaller client/client_agent.spec --distpath client/dist --workpath client/build --noconfirm
+          '
+          sudo chown -R "$(id -u):$(id -g)" client/dist client/build client/_version.py
 
-      - name: Build client_agent (Linux)
-        run: pyinstaller client/client_agent.spec --distpath client/dist --workpath client/build --noconfirm
-
-      # Бинарник должен запускаться и выбирать Linux-коллектор (без pywin32/WMI):
-      # --help не ходит в сеть и не пишет БД.
+      # Бинарник должен запускаться (--help не ходит в сеть и не пишет БД) и
+      # выбирать Linux-коллектор; bootloader не должен требовать glibc новее 2.28.
       - name: Check build output
         run: |
           test -x client/dist/client_agent || { echo "client/dist/client_agent not found or not executable"; exit 1; }
           ls -l client/dist/client_agent
           client/dist/client_agent --help
+          max="$(objdump -T client/dist/client_agent | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"
+          echo "bootloader max glibc symbol: $max"
+          if [ "$(printf '%s\n' "$max" GLIBC_2.28 | sort -V | tail -1)" != "GLIBC_2.28" ]; then
+            echo "bootloader requires glibc newer than 2.28"; exit 1
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
