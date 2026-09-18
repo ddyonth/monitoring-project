@@ -1283,6 +1283,8 @@ function getProcType(name) {
     }).join("");
   }
 
+  const LAST_ALERTS_BY_ID = {};
+
   async function loadAlerts() {
     const q = new URLSearchParams();
     q.set("since", isoSinceFromPeriod(byId("alPeriod")?.value || "7d"));
@@ -1300,6 +1302,7 @@ function getProcType(name) {
     if (ruleType) {
       items = items.filter(a => alertRuleGroup(a) === ruleType);
     }
+    for (const a of items) LAST_ALERTS_BY_ID[String(a.id)] = a;
 
     return `
       <div class="card" style="margin-bottom:12px;">
@@ -1331,6 +1334,7 @@ function getProcType(name) {
                   <td data-alert-status-cell="1" data-alert-id="${escapeHtml(String(a.id || ""))}">
                     <span data-alert-status-text="1">${escapeHtml(a.status || "")}</span>
                     <button data-alert-edit="1" data-alert-id="${escapeHtml(String(a.id || ""))}" style="margin-left:6px; padding:2px 8px; border-radius:999px; border:1px solid #ddd; cursor:pointer;">✏️</button>
+                    ${a.entity_type === "process_chain" ? `<button data-alert-graph="1" data-alert-id="${escapeHtml(String(a.id || ""))}" title="Посмотреть цепочку на вкладке «Графы»" style="margin-left:6px; padding:2px 8px; border-radius:999px; border:1px solid #ddd; cursor:pointer;">🌳 цепочка</button>` : ""}
                   </td>
 
                 </tr>
@@ -1349,6 +1353,13 @@ function getProcType(name) {
     root.dataset.alertEditorBound = "1";
 
     root.addEventListener("click", async (ev) => {
+      const graphBtn = ev.target && ev.target.closest ? ev.target.closest('button[data-alert-graph="1"]') : null;
+      if (graphBtn) {
+        const alertId = graphBtn.getAttribute("data-alert-id") || "";
+        if (alertId) await openGraphForAlert(alertId, LAST_ALERTS_BY_ID[alertId] || null);
+        return;
+      }
+
       const editBtn = ev.target && ev.target.closest ? ev.target.closest('button[data-alert-edit="1"]') : null;
       if (editBtn) {
         const alertId = editBtn.getAttribute("data-alert-id") || "";
