@@ -90,6 +90,46 @@ jobs:
           path: client/dist/client_agent.exe
           if-no-files-found: error
 
+  # Сборка агента под Linux (Astra/ALT): тот же client_agent.spec, что и для
+  # Windows (имя без расширения, console/upx под Linux не мешают). Ставятся
+  # только Linux-зависимости (client/requirements-linux.txt, без pywin32-ctypes
+  # и pefile). Артефакт публикуется в CI, в релизы сервера не попадает —
+  # publish-client-release по-прежнему только про Windows exe.
+  build-linux-agent:
+    name: Build Linux agent (PyInstaller)
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: client/requirements-linux.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r client/requirements-linux.txt
+
+      - name: Build client_agent (Linux)
+        run: pyinstaller client/client_agent.spec --distpath client/dist --workpath client/build --noconfirm
+
+      # Бинарник должен запускаться и выбирать Linux-коллектор (без pywin32/WMI):
+      # --help не ходит в сеть и не пишет БД.
+      - name: Check build output
+        run: |
+          test -x client/dist/client_agent || { echo "client/dist/client_agent not found or not executable"; exit 1; }
+          ls -l client/dist/client_agent
+          client/dist/client_agent --help
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: client_agent-linux
+          path: client/dist/client_agent
+          if-no-files-found: error
+
   # Сквозная проверка самообновления на настоящей Windows: собирает две версии
   # exe (текущую из client/VERSION и следующую), поднимает стаб сервера релизов
   # и запускает старую exe с --apply-update-now — она должна заменить саму себя

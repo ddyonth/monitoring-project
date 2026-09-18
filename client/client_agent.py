@@ -7,7 +7,6 @@ import stat
 import getpass
 import argparse
 import hashlib
-import platform
 import subprocess
 import threading
 from datetime import datetime, timezone
@@ -15,6 +14,23 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import psutil
 import requests
+
+
+def select_collectors(os_name: Optional[str] = None):
+    """
+    Платформенный коллектор: "nt" -> collectors_windows (WMI, Windows-фильтр
+    системных процессов), иначе -> collectors_linux (без WMI, Linux-фильтр).
+    Оба модуля реализуют один контракт (см. докстринг collectors_windows).
+    """
+    name = os_name if os_name is not None else os.name
+    if name == "nt":
+        import collectors_windows as mod
+    else:
+        import collectors_linux as mod
+    return mod
+
+
+collectors = select_collectors()
 # Config
 
 def _load_client_version() -> str:
@@ -217,106 +233,8 @@ def get_cached_sha256(conn: sqlite3.Connection, exe_path: Optional[str]) -> Opti
     return sha
 
 
-# WMI (Windows): internal time source
-
-_WMI_AVAILABLE = False
-try:
-    if os.name == "nt":
-        import pythoncom  # type: ignore
-        import win32com.client  # type: ignore
-        _WMI_AVAILABLE = True
-except Exception:
-    _WMI_AVAILABLE = False
-
-
-def _wmi_subscribe(conn: sqlite3.Connection, stop_evt: threading.Event) -> None:
-    """
-    Subscribes to Win32_ProcessStartTrace/StopTrace.
-    IMPORTANT: WMI is internal. We only update wmi_pid_state table.
-    """
-    if not _WMI_AVAILABLE:
-        return
-    try:
-        pythoncom.CoInitialize()
-        locator = win32com.client.Dispatch("WbemScripting.SWbemLocator")
-        svc = locator.ConnectServer(".", "root\\cimv2")
-
-        q_start = "SELECT * FROM Win32_ProcessStartTrace"
-        q_stop = "SELECT * FROM Win32_ProcessStopTrace"
-
-        start_w = svc.ExecNotificationQuery(q_start)
-        stop_w = svc.ExecNotificationQuery(q_stop)
-
-        cur = conn.cursor()
-
-        def iso_now() -> str:
-            return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-        while not stop_evt.is_set():
-            # Use short timeout-style polling
-            # SWbemEventSource doesn't have native timeout; emulate by alternating try/except
-            try:
-                ev = start_w.NextEvent(1000)  # ms
-                pid = int(getattr(ev, "ProcessID", 0) or 0)
-                ppid = int(getattr(ev, "ParentProcessID", 0) or 0)
-                pname = str(getattr(ev, "ProcessName", "") or "")
-                ts = iso_now()
-                if pid:
-                    cur.execute(
-                        """
-                        INSERT INTO wmi_pid_state(pid, start_time, end_time, process_name, ppid, updated_at)
-                        VALUES(?, ?, NULL, ?, ?, ?)
-                        ON CONFLICT(pid) DO UPDATE SET
-                            start_time=excluded.start_time,
-                            end_time=NULL,
-                            process_name=excluded.process_name,
-                            ppid=excluded.ppid,
-                            updated_at=excluded.updated_at
-                        """,
-                        (pid, ts, pname, ppid if ppid else None, ts),
-                    )
-                    conn.commit()
-            except Exception:
-                pass
-
-            try:
-                ev2 = stop_w.NextEvent(200)  # ms
-                pid2 = int(getattr(ev2, "ProcessID", 0) or 0)
-                pname2 = str(getattr(ev2, "ProcessName", "") or "")
-                ts2 = iso_now()
-                if pid2:
-                    cur.execute(
-                        """
-                        UPDATE wmi_pid_state
-                        SET end_time=?, process_name=COALESCE(?, process_name), updated_at=?
-                        WHERE pid=?
-                        """,
-                        (ts2, pname2 if pname2 else None, ts2, pid2),
-                    )
-                    conn.commit()
-            except Exception:
-                pass
-
-    except Exception:
-        # WMI failure should never stop the agent
-        return
-    finally:
-        try:
-            pythoncom.CoUninitialize()
-        except Exception:
-            pass
-
-
-def wmi_get_pid_times(conn: sqlite3.Connection, pid: int) -> Tuple[Optional[str], Optional[str], Optional[int], Optional[str]]:
-    """
-    Returns (start_time, end_time, ppid, process_name) from wmi_pid_state for pid.
-    """
-    cur = conn.cursor()
-    cur.execute("SELECT start_time, end_time, ppid, process_name FROM wmi_pid_state WHERE pid=?;", (int(pid),))
-    r = cur.fetchone()
-    if not r:
-        return None, None, None, None
-    return r["start_time"], r["end_time"], r["ppid"], r["process_name"]
+# WMI-подписка, wmi_get_pid_times, os_info и фильтр системных процессов —
+# в платформенных модулях collectors_windows / collectors_linux (см. select_collectors).
 
 
 # Collection
@@ -328,38 +246,11 @@ def get_machine_name() -> str:
         return "unknown-host"
 
 
-def os_info() -> str:
-    try:
-        if os.name == "nt":
-            edition = ""
-            try:
-                edition = platform.win32_edition()  # type: ignore[attr-defined]
-            except Exception:
-                edition = ""
-            rel = platform.release()
-            ver = platform.version()
-            base = f"Windows {rel}"
-            if edition:
-                base += f" {edition}"
-            if ver:
-                base += f" (build {ver})"
-            return base
-        return platform.platform()
-    except Exception:
-        return "unknown"
-
 
 def iso_from_ts(ts: float) -> str:
     # Always store UTC timestamps (timezone-aware) to keep duration math consistent
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(timespec="seconds")
 
-
-# System process filtering
-SYSTEM_USERS = {
-    "system", "local service", "network service",
-    "система", "локальная служба", "сетевая служба",
-    "локальная_служба", "сетевая_служба",
-}
 
 def normalize_username_display(u: Optional[str]) -> str:
     """Normalize username for storage/display: strip host/domain prefix like DESKTOP-XXX\\user."""
@@ -368,23 +259,6 @@ def normalize_username_display(u: Optional[str]) -> str:
         s = s.split("\\", 1)[1]
     return s
 
-
-def _norm_user(u: Optional[str]) -> str:
-    u2 = (u or "").strip().lower()
-    if "\\" in u2:
-        u2 = u2.split("\\", 1)[1]
-    return u2
-
-def is_system_process(user_name: Optional[str], exe_path: Optional[str], had_access_error: bool) -> bool:
-    """Return True for processes that should be excluded from monitoring."""
-    if had_access_error:
-        return True
-    if _norm_user(user_name) in SYSTEM_USERS:
-        return True
-    p = (exe_path or "").strip().lower().replace("/", "\\")
-    if p.startswith("c:\\windows\\"):
-        return True
-    return False
 
 
 def collect_slice(conn: sqlite3.Connection, client_version: str) -> None:
@@ -399,7 +273,13 @@ def collect_slice(conn: sqlite3.Connection, client_version: str) -> None:
     except Exception:
         boot = None
 
-    for p in psutil.process_iter(attrs=["pid", "ppid", "name", "exe", "username", "create_time"]):
+    # uids (реальный uid владельца) есть только на POSIX: на Windows psutil такого
+    # атрибута не знает, поэтому запрашиваем его только вне "nt"
+    attrs = ["pid", "ppid", "name", "exe", "username", "create_time"]
+    if os.name != "nt":
+        attrs.append("uids")
+
+    for p in psutil.process_iter(attrs=attrs):
         try:
             had_err = False
             try:
@@ -408,6 +288,13 @@ def collect_slice(conn: sqlite3.Connection, client_version: str) -> None:
                 if pid <= 0:
                     continue
                 ppid = info.get("ppid")
+                uid = None
+                try:
+                    uids = info.get("uids")
+                    if uids is not None:
+                        uid = int(uids.real)
+                except Exception:
+                    uid = None
                 pname = str(info.get("name") or "unknown")
                 exe = info.get("exe") or ""
                 uname_raw = info.get("username")  # может быть None/"" если владелец недоступен
@@ -421,7 +308,7 @@ def collect_slice(conn: sqlite3.Connection, client_version: str) -> None:
 
             if not pname:
                 continue
-            if is_system_process(uname, exe, had_err):
+            if collectors.is_system_process(uname, exe, had_err, ppid=ppid, pid=pid, uid=uid):
                 continue
 
             # base start_time from psutil
@@ -432,8 +319,8 @@ def collect_slice(conn: sqlite3.Connection, client_version: str) -> None:
             else:
                 st = now
 
-            # override with WMI start_time if present
-            wmi_st, wmi_end, wmi_ppid, wmi_pname = wmi_get_pid_times(conn, pid)
+            # override with WMI start_time if present (Linux: всегда None — нет уточнения)
+            wmi_st, wmi_end, wmi_ppid, wmi_pname = collectors.wmi_get_pid_times(conn, pid)
             if wmi_st:
                 st = wmi_st
             if wmi_ppid:
@@ -515,7 +402,7 @@ def collect_slice(conn: sqlite3.Connection, client_version: str) -> None:
                     now,
                     dur,
                     boot,
-                    os_info(),
+                    collectors.os_info(),
                     user,
                     client_version,
                     cpu_user,
@@ -564,7 +451,7 @@ def materialize_finished(conn: sqlite3.Connection, sample_now: str, client_versi
         return
 
     machine = get_machine_name()
-    os_s = os_info()
+    os_s = collectors.os_info()
 
     for r in rows:
         pid = int(r["pid"])
@@ -971,10 +858,10 @@ def main() -> int:
     conn = db_connect(db_path)
     ensure_schema(conn)
 
-    # Start WMI watcher (Windows, optional)
+    # Start WMI watcher (Windows only; на Linux collectors.WMI_AVAILABLE == False)
     stop_evt = threading.Event()
-    if _WMI_AVAILABLE:
-        t = threading.Thread(target=_wmi_subscribe, args=(conn, stop_evt), daemon=True)
+    if collectors.WMI_AVAILABLE:
+        t = threading.Thread(target=collectors._wmi_subscribe, args=(conn, stop_evt), daemon=True)
         t.start()
 
     try:

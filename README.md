@@ -158,6 +158,20 @@ Get-ScheduledTask -TaskName "MonitoringAgent-*" | Format-Table TaskName, State
 Переменные из `setx` попадают в новые процессы, поэтому после них перезапустите
 агент (или дождитесь сторожа).
 
+### Linux-агент (Astra/ALT): только от root
+
+Тот же `client_agent.py` работает на Linux с коллектором
+`client/collectors_linux.py` (сборка — джоба `build-linux-agent`, артефакт
+`client_agent-linux`). Запускать его нужно **от root** — как системный сервис
+systemd, а не пользовательский (`systemd --user`): без root ядро не даёт
+прочитать `/proc/<pid>/exe` чужих процессов, psutil подставляет путь из
+`argv[0]` или отдаёт пустой `exe_path`, и агент не видит ни sha256, ни
+root-сессии других пользователей (проверено на ALT Workstation 11.1).
+Системные процессы отсекаются в `is_system_process` по трём правилам:
+kernel threads (`pid`/`ppid == 2`), сервисные учётки (`uid < UID_MIN` из
+`/etc/login.defs`) и root-демоны, запущенные init'ом из системных каталогов.
+Юнита systemd в репозитории пока нет — это отдельная задача.
+
 ## CI/CD: автопубликация релиза агента
 
 В `.github/workflows/ci.yml` джоба `publish-client-release` берёт
