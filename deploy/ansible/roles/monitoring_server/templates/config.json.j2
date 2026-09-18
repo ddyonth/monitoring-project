@@ -1,5 +1,6 @@
 {
   "listen_host": "{{ monitoring_listen_host }}",
   "listen_port": {{ monitoring_listen_port }},
-  "web_refresh_seconds": {{ monitoring_web_refresh_seconds }}
+  "web_refresh_seconds": {{ monitoring_web_refresh_seconds }},
+  "dashboard_base_url": "{{ monitoring_dashboard_base_url | default('') }}"
 }
