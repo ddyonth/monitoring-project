@@ -1186,6 +1186,8 @@ function getProcType(name) {
 
     <div id="anAlertsOut"></div>
 
+    <div id="anRulesOut"></div>
+
     <div class="card" style="margin:12px 0;">
       <h3 style="margin-top:0;">Профили</h3>
       <div class="badge" style="display:flex; flex-wrap:wrap; gap:10px; align-items:center;">
@@ -1546,7 +1548,325 @@ function getProcType(name) {
   await loadChainsList();
   await refreshAnalytics();
   wireAlertsEditor();
+  await renderAlertRules();
 }
+
+  // ---------------------------------------------------------------------------
+  // Правила email-уведомлений (эпик 5): раздел под списком алертов на «Аналитике».
+  // API: GET /api/alert-rules, POST /api/alert-rule-item, POST /api/alert-rule-item/{id}/delete,
+  // GET /api/alert-rules/{id}/notifications?limit=1 (статус последней отправки).
+  // ---------------------------------------------------------------------------
+  const NR_ENTITY_TYPES = ["process_session", "process_chain"];
+  const NR_METRICS = [
+    "rarity", "chain_rarity", "chain_depth_anomaly", "chain_fanout_anomaly", "role_type_mismatch",
+    "time_anomaly", "cpu_delta", "io_delta", "rss", "net_conn_count"
+  ];
+  const NR_EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+  let NR_RULES = [];
+  let NR_MACHINES = [];
+
+  function nrBtnStyle() {
+    return 'padding:4px 10px; border-radius:999px; border:1px solid #ddd; cursor:pointer; background:#fff;';
+  }
+
+  function nrListText(arr, anyLabel) {
+    return (arr && arr.length) ? arr.join(", ") : anyLabel;
+  }
+
+  function nrFiltersText(r) {
+    return [
+      `сущности: ${nrListText(r.entity_types, "любые")}`,
+      `метрики: ${nrListText(r.metrics, "любые")}`,
+      `машины: ${nrListText(r.machine_names, "любые")}`,
+      `уровень ≥ ${r.severity_min || "любой"}`
+    ].join("; ");
+  }
+
+  function nrTriggerText(r) {
+    if (r.trigger_mode === "repeat_count") {
+      const win = r.repeat_window_minutes ? `за ${r.repeat_window_minutes} мин` : "без окна";
+      return `≥ ${r.repeat_threshold} повторов серии (${win})`;
+    }
+    return "сразу";
+  }
+
+  function nrLastStatusHtml(n) {
+    if (!n) return `<span class="muted">не отправлялось</span>`;
+    const when = escapeHtml(fmtLocalTs(n.sent_at || ""));
+    if (n.status === "sent") {
+      return `<span class="mono">${when}</span> <span class="pill on">отправлено</span>`;
+    }
+    return `<span class="mono">${when}</span> <span class="pill off" title="${escapeHtml(n.error || "")}">ошибка</span>` +
+      `<div class="hint" style="max-width:260px; white-space:pre-wrap;">${escapeHtml(n.error || "")}</div>`;
+  }
+
+  async function nrLoadLastStatuses(rules) {
+    const out = {};
+    await Promise.all(rules.map(async (r) => {
+      try {
+        const d = await apiGetJson(`/api/alert-rules/${encodeURIComponent(r.id)}/notifications?limit=1`);
+        out[String(r.id)] = (d.items && d.items.length) ? d.items[0] : null;
+      } catch (e) {
+        out[String(r.id)] = { status: "failed", sent_at: "", error: `не удалось загрузить статус: ${e.message || e}` };
+      }
+    }));
+    return out;
+  }
+
+  function nrRenderTable(rules, lastById) {
+    const rows = rules.map(r => `
+      <tr data-nr-row="${escapeHtml(String(r.id))}">
+        <td class="mono">${escapeHtml(String(r.id))}</td>
+        <td><b>${escapeHtml(r.name || "")}</b></td>
+        <td>${r.enabled ? `<span class="pill on">вкл</span>` : `<span class="pill off">выкл</span>`}</td>
+        <td style="max-width:360px; white-space:pre-wrap;">${escapeHtml(nrFiltersText(r))}</td>
+        <td>${escapeHtml(nrTriggerText(r))}</td>
+        <td>${r.resend_mode === "every_occurrence" ? "каждый раз" : "один раз на серию"}</td>
+        <td class="mono" style="white-space:pre-wrap;">${escapeHtml((r.recipients || []).join(", "))}</td>
+        <td data-nr-last="${escapeHtml(String(r.id))}">${nrLastStatusHtml(lastById[String(r.id)])}</td>
+        <td style="white-space:nowrap;">
+          <button data-nr-edit="${escapeHtml(String(r.id))}" style="${nrBtnStyle()}" title="Редактировать">✏️</button>
+          <button data-nr-del="${escapeHtml(String(r.id))}" style="${nrBtnStyle()} margin-left:4px;" title="Удалить">🗑</button>
+        </td>
+      </tr>`).join("");
+    return `
+      <div class="tableWrap"><table>
+        <thead><tr>
+          <th>ID</th><th>Название</th><th>Вкл</th><th>Фильтры</th><th>Триггер</th>
+          <th>Повторная отправка</th><th>Получатели</th><th>Последняя отправка</th><th></th>
+        </tr></thead>
+        <tbody>${rows || `<tr><td colspan="9" class="muted">Правил пока нет</td></tr>`}</tbody>
+      </table></div>`;
+  }
+
+  function nrOptions(values, selected, labelFn) {
+    const sel = new Set((selected || []).map(String));
+    return values.map(v => {
+      const val = typeof v === "string" ? v : v.value;
+      const label = labelFn ? labelFn(v) : val;
+      return `<option value="${escapeHtml(val)}"${sel.has(val) ? " selected" : ""}>${escapeHtml(label)}</option>`;
+    }).join("");
+  }
+
+  function nrRenderEditor(rule) {
+    const r = rule || {};
+    const isEdit = r.id != null;
+    const trig = r.trigger_mode || "immediate";
+    const resend = r.resend_mode || "once";
+    const machineOpts = NR_MACHINES.map(m => ({ value: m.machine_name || "", alias: m.alias || "" }));
+    const inp = 'padding:4px 6px; border:1px solid #ddd; border-radius:6px;';
+    return `
+      <div style="display:flex; flex-direction:column; gap:10px; margin-top:10px; padding:10px 12px; border:1px solid #ddd; border-radius:12px; background:#fff;" data-nr-editor="1">
+        <div style="font-weight:700;">${isEdit ? `Правило #${escapeHtml(String(r.id))}` : "Новое правило"}</div>
+        <input type="hidden" id="nrId" value="${isEdit ? escapeHtml(String(r.id)) : ""}">
+
+        <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center;">
+          <label class="muted">Название:</label>
+          <input id="nrName" type="text" value="${escapeHtml(r.name || "")}" style="${inp} min-width:260px;">
+          <label class="chk"><input id="nrEnabled" type="checkbox"${(r.enabled == null || r.enabled) ? " checked" : ""}> включено</label>
+        </div>
+
+        <div style="display:flex; gap:16px; flex-wrap:wrap; align-items:flex-start;">
+          <div>
+            <div class="muted">Сущности <span class="hint">(пусто = любые)</span></div>
+            <select id="nrEntityTypes" multiple size="2" style="${inp} min-width:180px;">${nrOptions(NR_ENTITY_TYPES, r.entity_types)}</select>
+          </div>
+          <div>
+            <div class="muted">Метрики <span class="hint">(пусто = любые)</span></div>
+            <select id="nrMetrics" multiple size="6" style="${inp} min-width:200px;">${nrOptions(NR_METRICS, r.metrics)}</select>
+          </div>
+          <div>
+            <div class="muted">Машины <span class="hint">(пусто = любые)</span></div>
+            <select id="nrMachines" multiple size="6" style="${inp} min-width:200px;">${
+              nrOptions(machineOpts, r.machine_names, m => m.alias ? `${m.value} (${m.alias})` : m.value)
+            }</select>
+          </div>
+          <div>
+            <div class="muted">Минимальный уровень</div>
+            <select id="nrSeverityMin" style="${inp}">
+              ${nrOptions([{ value: "" }, { value: "low" }, { value: "med" }, { value: "high" }], [r.severity_min || ""], o => o.value || "(любой)")}
+            </select>
+          </div>
+        </div>
+
+        <div style="display:flex; gap:16px; flex-wrap:wrap; align-items:center;">
+          <span class="muted">Триггер:</span>
+          <label class="chk"><input type="radio" name="nrTrigger" value="immediate"${trig === "immediate" ? " checked" : ""}> сразу</label>
+          <label class="chk"><input type="radio" name="nrTrigger" value="repeat_count"${trig === "repeat_count" ? " checked" : ""}> по числу повторов</label>
+          <span id="nrRepeatFields" style="display:${trig === "repeat_count" ? "inline-flex" : "none"}; gap:10px; align-items:center;">
+            <label class="muted">порог (≥2):</label>
+            <input id="nrRepeatThreshold" type="number" min="2" value="${escapeHtml(String(r.repeat_threshold ?? 2))}" style="${inp} width:80px;">
+            <label class="muted">окно, мин (пусто = без окна):</label>
+            <input id="nrRepeatWindow" type="number" min="1" value="${r.repeat_window_minutes != null ? escapeHtml(String(r.repeat_window_minutes)) : ""}" style="${inp} width:90px;">
+          </span>
+        </div>
+
+        <div style="display:flex; gap:16px; flex-wrap:wrap; align-items:center;">
+          <span class="muted">Повторная отправка:</span>
+          <label class="chk"><input type="radio" name="nrResend" value="once"${resend === "once" ? " checked" : ""}> один раз на серию</label>
+          <label class="chk"><input type="radio" name="nrResend" value="every_occurrence"${resend === "every_occurrence" ? " checked" : ""}> при каждом срабатывании</label>
+        </div>
+
+        <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center;">
+          <label class="muted">Получатели (через запятую):</label>
+          <input id="nrRecipients" type="text" value="${escapeHtml((r.recipients || []).join(", "))}" style="${inp} min-width:360px;" placeholder="admin@example.com, soc@example.com">
+        </div>
+
+        <div id="nrError" class="error"></div>
+        <div style="display:flex; gap:8px;">
+          <button data-nr-save="1" style="${nrBtnStyle()} background:#111; color:#fff; border-color:#111;">Сохранить</button>
+          <button data-nr-cancel="1" style="${nrBtnStyle()}">Отмена</button>
+        </div>
+      </div>`;
+  }
+
+  function nrSelectedValues(sel) {
+    return sel ? Array.from(sel.selectedOptions).map(o => o.value).filter(Boolean) : [];
+  }
+
+  function nrReadForm(ed) {
+    const errors = [];
+    const name = (ed.querySelector("#nrName")?.value || "").trim();
+    if (!name) errors.push("Укажите название правила.");
+
+    const recipients = (ed.querySelector("#nrRecipients")?.value || "").split(",").map(s => s.trim()).filter(Boolean);
+    if (!recipients.length) errors.push("Укажите хотя бы одного получателя.");
+    const badEmails = recipients.filter(e => !NR_EMAIL_RE.test(e));
+    if (badEmails.length) errors.push(`Некорректный email: ${badEmails.join(", ")}`);
+
+    const trigger_mode = ed.querySelector('input[name="nrTrigger"]:checked')?.value || "immediate";
+    let repeat_threshold = null, repeat_window_minutes = null;
+    if (trigger_mode === "repeat_count") {
+      repeat_threshold = parseInt(ed.querySelector("#nrRepeatThreshold")?.value || "", 10);
+      if (!Number.isFinite(repeat_threshold) || repeat_threshold < 2) errors.push("Порог повторов должен быть целым числом ≥ 2.");
+      const w = (ed.querySelector("#nrRepeatWindow")?.value || "").trim();
+      if (w) {
+        repeat_window_minutes = parseInt(w, 10);
+        if (!Number.isFinite(repeat_window_minutes) || repeat_window_minutes < 1) errors.push("Окно должно быть целым числом минут ≥ 1.");
+      }
+    }
+    const resend_mode = ed.querySelector('input[name="nrResend"]:checked')?.value || "once";
+    const idRaw = (ed.querySelector("#nrId")?.value || "").trim();
+
+    const payload = {
+      name,
+      enabled: !!ed.querySelector("#nrEnabled")?.checked,
+      entity_types: nrSelectedValues(ed.querySelector("#nrEntityTypes")),
+      metrics: nrSelectedValues(ed.querySelector("#nrMetrics")),
+      machine_names: nrSelectedValues(ed.querySelector("#nrMachines")),
+      severity_min: ed.querySelector("#nrSeverityMin")?.value || null,
+      trigger_mode, repeat_threshold, repeat_window_minutes, resend_mode, recipients
+    };
+    if (idRaw) payload.id = Number(idRaw);
+    return { payload, errors };
+  }
+
+  async function nrPaintTable() {
+    const tableEl = byId("nrTable");
+    if (!tableEl) return;
+    try {
+      const data = await apiGetJson("/api/alert-rules");
+      NR_RULES = data.items || [];
+      const lastById = await nrLoadLastStatuses(NR_RULES);
+      tableEl.innerHTML = nrRenderTable(NR_RULES, lastById);
+    } catch (e) {
+      tableEl.innerHTML = `<div class="error">Ошибка загрузки правил: ${escapeHtml(e.message || String(e))}</div>`;
+    }
+  }
+
+  async function renderAlertRules() {
+    const root = byId("anRulesOut");
+    if (!root) return;
+    root.innerHTML = `
+      <div class="card" style="margin-bottom:12px;">
+        <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+          <h3 style="margin:0;">Email-уведомления: правила</h3>
+          <button id="nrAdd" style="${nrBtnStyle()}">+ Добавить правило</button>
+          <button id="nrRefresh" style="${nrBtnStyle()}">Обновить</button>
+          <span class="hint">Письмо уходит при вставке нового алерта, подходящего под фильтры правила.</span>
+        </div>
+        <div id="nrTable" style="margin-top:10px;"><div class="muted">загрузка...</div></div>
+        <div id="nrEditor"></div>
+      </div>`;
+
+    try {
+      const m = await apiGetJson("/api/machines");
+      NR_MACHINES = (m && m.items) ? m.items : [];
+    } catch (e) {
+      NR_MACHINES = [];
+    }
+    await nrPaintTable();
+
+    if (root.dataset.nrBound === "1") return;
+    root.dataset.nrBound = "1";
+
+    root.addEventListener("change", (ev) => {
+      const t = ev.target;
+      if (t && t.name === "nrTrigger") {
+        const f = byId("nrRepeatFields");
+        if (f) f.style.display = (t.value === "repeat_count") ? "inline-flex" : "none";
+      }
+    });
+
+    root.addEventListener("click", async (ev) => {
+      const target = ev.target;
+      const closest = (sel) => (target && target.closest ? target.closest(sel) : null);
+      const editor = byId("nrEditor");
+
+      if (closest("#nrAdd")) {
+        editor.innerHTML = nrRenderEditor(null);
+        return;
+      }
+      if (closest("#nrRefresh")) {
+        await nrPaintTable();
+        return;
+      }
+      const editBtn = closest("button[data-nr-edit]");
+      if (editBtn) {
+        const id = editBtn.getAttribute("data-nr-edit");
+        const rule = NR_RULES.find(r => String(r.id) === String(id)) || null;
+        editor.innerHTML = nrRenderEditor(rule);
+        editor.scrollIntoView({ block: "nearest" });
+        return;
+      }
+      const delBtn = closest("button[data-nr-del]");
+      if (delBtn) {
+        const id = delBtn.getAttribute("data-nr-del");
+        const rule = NR_RULES.find(r => String(r.id) === String(id));
+        if (!confirm(`Удалить правило «${rule ? rule.name : id}»?`)) return;
+        try {
+          await apiPostJson(`/api/alert-rule-item/${encodeURIComponent(id)}/delete`, {});
+          if (byId("nrId") && byId("nrId").value === String(id)) editor.innerHTML = "";
+          await nrPaintTable();
+        } catch (e) {
+          byId("nrTable").insertAdjacentHTML("beforeend", `<div class="error">Ошибка удаления: ${escapeHtml(e.message || String(e))}</div>`);
+        }
+        return;
+      }
+      if (closest("button[data-nr-cancel]")) {
+        editor.innerHTML = "";
+        return;
+      }
+      if (closest("button[data-nr-save]")) {
+        const ed = editor.querySelector('[data-nr-editor="1"]');
+        if (!ed) return;
+        const errEl = ed.querySelector("#nrError");
+        const { payload, errors } = nrReadForm(ed);
+        if (errors.length) {
+          errEl.textContent = errors.join("\n");
+          return;
+        }
+        errEl.textContent = "";
+        try {
+          await apiPostJson("/api/alert-rule-item", payload);
+          editor.innerHTML = "";
+          await nrPaintTable();
+        } catch (e) {
+          errEl.textContent = `Ошибка сохранения: ${e.message || String(e)}`;
+        }
+      }
+    });
+  }
 
   // Settings tab
 
