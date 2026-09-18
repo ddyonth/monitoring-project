@@ -7,7 +7,7 @@
   _wmi_subscribe(conn, stop_evt)     — фоновый поток: заполняет таблицу wmi_pid_state
   wmi_get_pid_times(conn, pid)       — (start_time, end_time, ppid, process_name) или (None,)*4
   os_info()                          — строка ОС для события
-  is_system_process(user_name, exe_path, had_access_error, ppid=None)
+  is_system_process(user_name, exe_path, had_access_error, ppid=None, pid=None, uid=None)
                                      — True для процессов, которые не мониторим
 
 WMI даёт точные start_time/ppid/process_name для короткоживущих процессов,
@@ -157,8 +157,10 @@ def _norm_user(u: Optional[str]) -> str:
 
 
 def is_system_process(user_name: Optional[str], exe_path: Optional[str], had_access_error: bool,
-                      ppid: Optional[int] = None) -> bool:
-    """Return True for processes that should be excluded from monitoring (ppid на Windows не используется)."""
+                      ppid: Optional[int] = None, pid: Optional[int] = None,
+                      uid: Optional[int] = None) -> bool:
+    """Return True for processes that should be excluded from monitoring
+    (ppid/pid/uid — часть общего контракта с collectors_linux, на Windows не используются)."""
     if had_access_error:
         return True
     if _norm_user(user_name) in SYSTEM_USERS:

@@ -273,7 +273,13 @@ def collect_slice(conn: sqlite3.Connection, client_version: str) -> None:
     except Exception:
         boot = None
 
-    for p in psutil.process_iter(attrs=["pid", "ppid", "name", "exe", "username", "create_time"]):
+    # uids (реальный uid владельца) есть только на POSIX: на Windows psutil такого
+    # атрибута не знает, поэтому запрашиваем его только вне "nt"
+    attrs = ["pid", "ppid", "name", "exe", "username", "create_time"]
+    if os.name != "nt":
+        attrs.append("uids")
+
+    for p in psutil.process_iter(attrs=attrs):
         try:
             had_err = False
             try:
@@ -282,6 +288,13 @@ def collect_slice(conn: sqlite3.Connection, client_version: str) -> None:
                 if pid <= 0:
                     continue
                 ppid = info.get("ppid")
+                uid = None
+                try:
+                    uids = info.get("uids")
+                    if uids is not None:
+                        uid = int(uids.real)
+                except Exception:
+                    uid = None
                 pname = str(info.get("name") or "unknown")
                 exe = info.get("exe") or ""
                 uname_raw = info.get("username")  # может быть None/"" если владелец недоступен
@@ -295,7 +308,7 @@ def collect_slice(conn: sqlite3.Connection, client_version: str) -> None:
 
             if not pname:
                 continue
-            if collectors.is_system_process(uname, exe, had_err, ppid=ppid):
+            if collectors.is_system_process(uname, exe, had_err, ppid=ppid, pid=pid, uid=uid):
                 continue
 
             # base start_time from psutil
