@@ -63,7 +63,19 @@ def wmi_get_pid_times(conn: sqlite3.Connection, pid: int) -> Tuple[Optional[str]
 
 
 def os_info() -> str:
+    """
+    Человекочитаемое имя ОС из /etc/os-release (PRETTY_NAME, иначе NAME),
+    например «ALT Workstation 11.1 (Prometheus)». Если platform.freedesktop_os_release()
+    недоступен (Python < 3.10) или падает (нет /etc/os-release) — platform.platform().
+    """
     try:
+        try:
+            rel = platform.freedesktop_os_release()  # type: ignore[attr-defined]
+            name = str(rel.get("PRETTY_NAME") or rel.get("NAME") or "").strip()
+            if name:
+                return name
+        except Exception:
+            pass
         return platform.platform()
     except Exception:
         return "unknown"
