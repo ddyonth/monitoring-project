@@ -281,6 +281,9 @@ jobs:
 
       # Значения не подставляются в командную строку (не видны в ps):
       # python читает их из окружения и пишет JSON в файл с правами 0600.
+      # SMTP_* (email-уведомления по алертам) опциональны: незаданный секрет
+      # пишется пустой строкой, .env.j2 такую переменную не рендерит, и сервер
+      # просто не шлёт почту — поэтому проверки test -n для них нет.
       - name: Write secrets to a temporary extra-vars file
         id: extra_vars
         shell: bash
@@ -288,6 +291,11 @@ jobs:
           MONITORING_API_KEY: ${{ secrets.MONITORING_API_KEY }}
           MONITORING_CLIENT_UPDATE_KEY: ${{ secrets.MONITORING_CLIENT_UPDATE_KEY }}
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_FROM: ${{ secrets.SMTP_FROM }}
         run: |
           for name in MONITORING_API_KEY MONITORING_CLIENT_UPDATE_KEY POSTGRES_PASSWORD; do
             test -n "${!name}" || { echo "secret $name is not set"; exit 1; }
@@ -301,6 +309,11 @@ jobs:
                   "monitoring_api_key": os.environ["MONITORING_API_KEY"],
                   "monitoring_client_update_key": os.environ["MONITORING_CLIENT_UPDATE_KEY"],
                   "monitoring_postgres_password": os.environ["POSTGRES_PASSWORD"],
+                  "monitoring_smtp_host": os.environ.get("SMTP_HOST", ""),
+                  "monitoring_smtp_port": os.environ.get("SMTP_PORT", ""),
+                  "monitoring_smtp_user": os.environ.get("SMTP_USER", ""),
+                  "monitoring_smtp_password": os.environ.get("SMTP_PASSWORD", ""),
+                  "monitoring_smtp_from": os.environ.get("SMTP_FROM", ""),
               }, f)
           EOF
           echo "file=$file" >> "$GITHUB_OUTPUT"
