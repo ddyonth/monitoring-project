@@ -3151,9 +3151,16 @@ def get_alerts(
     user: str = "",
     metric: str = "",
     entity_type: str = "",
+    pid: Optional[int] = None,
+    start_time: str = "",
     limit: int = 200,
     offset: int = 0,
 ):
+    """
+    pid / start_time — точечный фильтр по узлу дерева процессов (alerts.pid,
+    alerts.start_time), вместе с machine — «есть ли алерт по этой сессии»
+    (вкладка «Графы», клик по узлу).
+    """
     require_api_key(x_api_key)
 
     wh = []
@@ -3180,6 +3187,12 @@ def get_alerts(
     if entity_type.strip():
         wh.append("entity_type = %s")
         params.append(entity_type.strip())
+    if pid is not None:
+        wh.append("pid = %s")
+        params.append(int(pid))
+    if start_time.strip():
+        wh.append("start_time = %s")
+        params.append(start_time.strip())
 
     where_sql = ("WHERE " + " AND ".join(wh)) if wh else ""
 

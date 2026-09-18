@@ -120,6 +120,39 @@
       box-shadow: 0 8px 24px rgba(0,0,0,0.08);
     }
 
+    /* ===== Graphs tab: process tree (эпик 3, фазы B/C) ===== */
+    .grViewport {
+      position: relative; height: 70vh; min-height: 420px;
+      border: 1px solid #ddd; border-radius: 10px; overflow: hidden;
+      background: #fcfcfc; cursor: grab; user-select: none;
+    }
+    .grViewport.dragging { cursor: grabbing; }
+    .grCanvas { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
+    .grEdges { position: absolute; left: 0; top: 0; overflow: visible; pointer-events: none; }
+    .grEdges line { stroke: #bbb; stroke-width: 1.5; }
+    .grNode {
+      position: absolute; box-sizing: border-box; border: 1px solid #bbb; border-radius: 8px;
+      background: #fff; padding: 6px 8px; font-size: 12px; cursor: pointer;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.06);
+    }
+    .grNode:hover { border-color: #111; }
+    .grNode.grRoot { border-width: 2px; border-color: #111; }
+    /* узел с алертом: красный контур, едва заметная красная заливка */
+    .grNode.grAlert { border-color: #b00020; box-shadow: 0 0 0 2px rgba(176,0,32,0.2); background: rgba(176,0,32,0.03); }
+    .grNode.grSelected { outline: 2px dashed #666; outline-offset: 2px; }
+    .grNode .grName { font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .grNode .grMeta { color: #666; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .grLabel {
+      position: absolute; font-size: 11px; color: #b00020; background: rgba(255,255,255,0.96);
+      border: 1px solid rgba(176,0,32,0.35); border-radius: 6px; padding: 4px 6px;
+      width: max-content; max-width: 300px; white-space: pre-wrap; z-index: 3; box-sizing: border-box;
+    }
+    .grLabel.soft { color: #666; border-color: #ddd; }
+    .grTrunc {
+      position: absolute; box-sizing: border-box; font-size: 11px; color: #8a6d00; background: #fff7d6;
+      border: 1px dashed #b58900; border-radius: 8px; padding: 6px 8px; text-align: center;
+    }
+    .grLegend { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; font-size: 12px; color: #666; margin: 6px 0; }
   </style>
 </head>
 <body>
@@ -133,6 +166,7 @@
   <div class="tabsbar">
     <button class="tabbtn active" data-tab="monitoring">Мониторинг</button>
     <button class="tabbtn" data-tab="analytics">Аналитика</button>
+    <button class="tabbtn" data-tab="graphs">Графы</button>
     <button class="tabbtn" data-tab="settings">Настройки</button>
   </div>
 
@@ -203,6 +237,10 @@
 
   <div id="tab-analytics" class="tab">
     <div id="analyticsRoot"></div>
+  </div>
+
+  <div id="tab-graphs" class="tab">
+    <div id="graphsRoot"></div>
   </div>
 
   <div id="tab-settings" class="tab">
