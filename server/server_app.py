@@ -2,8 +2,10 @@ import hashlib
 import json
 import os
 import re
+import smtplib
 import sys
 import time
+from email.mime.text import MIMEText
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -37,6 +39,8 @@ CFG_ENV_OVERRIDES = {
     "api_key": "MONITORING_API_KEY",
     "client_update_key": "MONITORING_CLIENT_UPDATE_KEY",
     "database_url": "MONITORING_DATABASE_URL",
+    # базовый URL дашборда для ссылки в email-уведомлениях (эпик 5); пусто = без ссылки
+    "dashboard_base_url": "MONITORING_DASHBOARD_URL",
 }
 
 # analytics defaults
@@ -64,6 +68,15 @@ CHAIN_FANOUT_MIN_PARENTS_DEFAULT = 3      # минимум прошлых сес
 
 ALERT_BASELINE_WINDOW_DAYS_DEFAULT = 14
 ALERT_BASELINE_MIN_POINTS_DEFAULT = 20
+
+# Email-уведомления (эпик 5): порядок severity для severity_min и допустимые режимы правил
+SEVERITY_ORDER = {"low": 0, "med": 1, "high": 2}
+NOTIFY_TRIGGER_MODES = ("immediate", "repeat_count")
+NOTIFY_RESEND_MODES = ("once", "every_occurrence")
+# SMTP только из окружения (секреты не хранятся в config.json); STARTTLS, порт по умолчанию 587
+SMTP_PORT_DEFAULT = 587
+SMTP_TIMEOUT_SECONDS = 15
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 # ratio K + absolute thresholds
 ALERT_RULES = {
@@ -385,6 +398,45 @@ def ensure_schema() -> None:
 
     # strict hourly dedup
     cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_alerts_dedup_key ON alerts(dedup_key);")
+
+    # --- email-уведомления по алертам (эпик 5): правила и журнал попыток отправки.
+    # NULL/пустой массив в фильтре правила = любое значение подходит.
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS alert_notification_rules (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            enabled BOOLEAN NOT NULL DEFAULT true,
+            entity_types TEXT[] NULL,
+            metrics TEXT[] NULL,
+            severity_min TEXT NULL,
+            machine_names TEXT[] NULL,
+            trigger_mode TEXT NOT NULL,            -- 'immediate' | 'repeat_count'
+            repeat_threshold INT NULL,
+            repeat_window_minutes INT NULL,
+            resend_mode TEXT NOT NULL DEFAULT 'once',  -- 'once' | 'every_occurrence'
+            recipients TEXT[] NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS alert_notifications (
+            id SERIAL PRIMARY KEY,
+            rule_id INT NOT NULL REFERENCES alert_notification_rules(id) ON DELETE CASCADE,
+            alert_id INT NOT NULL REFERENCES alerts(id) ON DELETE CASCADE,
+            series_key TEXT NOT NULL,
+            sent_at TEXT NOT NULL,
+            status TEXT NOT NULL,                  -- 'sent' | 'failed'
+            error TEXT NULL
+        );
+        """
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_alert_notifications_rule_series ON alert_notifications(rule_id, series_key);"
+    )
 
 
     conn.commit()
@@ -871,6 +923,190 @@ def upsert_chain_catalog_item(payload: Dict[str, Any] = Body(...), x_api_key: Op
     conn.close()
     return {"ok": True}
 
+
+# Правила email-уведомлений (эпик 5): CRUD по образцу chain-catalog
+
+def _norm_str_list(value: Any) -> Optional[List[str]]:
+    """Список строк из списка или строки через запятую; пусто -> None (= любое значение)."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        items = [x.strip() for x in value.split(",")]
+    elif isinstance(value, (list, tuple)):
+        items = [str(x).strip() for x in value]
+    else:
+        raise HTTPException(status_code=400, detail="list of strings expected")
+    items = [x for x in items if x]
+    return items or None
+
+
+def _parse_optional_int(value: Any, field: str, minimum: int) -> Optional[int]:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"{field} must be an integer")
+    if n < minimum:
+        raise HTTPException(status_code=400, detail=f"{field} must be >= {minimum}")
+    return n
+
+
+def _validate_alert_rule_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    name = str(payload.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name required")
+
+    recipients = _norm_str_list(payload.get("recipients")) or []
+    if not recipients:
+        raise HTTPException(status_code=400, detail="recipients required (at least one email)")
+    bad = [r for r in recipients if not _EMAIL_RE.match(r)]
+    if bad:
+        raise HTTPException(status_code=400, detail=f"invalid email: {', '.join(bad)}")
+
+    trigger_mode = str(payload.get("trigger_mode") or "").strip()
+    if trigger_mode not in NOTIFY_TRIGGER_MODES:
+        raise HTTPException(status_code=400, detail="trigger_mode must be 'immediate' or 'repeat_count'")
+
+    repeat_threshold = None
+    repeat_window_minutes = None
+    if trigger_mode == "repeat_count":
+        repeat_threshold = _parse_optional_int(payload.get("repeat_threshold"), "repeat_threshold", 2)
+        if repeat_threshold is None:
+            raise HTTPException(status_code=400, detail="repeat_threshold required for repeat_count (>= 2)")
+        repeat_window_minutes = _parse_optional_int(payload.get("repeat_window_minutes"), "repeat_window_minutes", 1)
+
+    resend_mode = str(payload.get("resend_mode") or "once").strip()
+    if resend_mode not in NOTIFY_RESEND_MODES:
+        raise HTTPException(status_code=400, detail="resend_mode must be 'once' or 'every_occurrence'")
+
+    severity_min = str(payload.get("severity_min") or "").strip() or None
+    if severity_min is not None and severity_min not in SEVERITY_ORDER:
+        raise HTTPException(status_code=400, detail="severity_min must be low, med or high")
+
+    enabled = payload.get("enabled", True)
+    if isinstance(enabled, str):
+        enabled = enabled.strip().lower() in ("1", "true", "yes", "on")
+
+    return {
+        "name": name,
+        "enabled": bool(enabled),
+        "entity_types": _norm_str_list(payload.get("entity_types")),
+        "metrics": _norm_str_list(payload.get("metrics")),
+        "severity_min": severity_min,
+        "machine_names": _norm_str_list(payload.get("machine_names")),
+        "trigger_mode": trigger_mode,
+        "repeat_threshold": repeat_threshold,
+        "repeat_window_minutes": repeat_window_minutes,
+        "resend_mode": resend_mode,
+        "recipients": recipients,
+    }
+
+
+@app.get("/api/alert-rules")
+def get_alert_rules(x_api_key: Optional[str] = Header(default=None)):
+    require_api_key(x_api_key)
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM alert_notification_rules ORDER BY id")
+    items = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return {"items": items}
+
+
+@app.post("/api/alert-rule-item")
+def upsert_alert_rule_item(payload: Dict[str, Any] = Body(...), x_api_key: Optional[str] = Header(default=None)):
+    require_api_key(x_api_key)
+    fields = _validate_alert_rule_payload(payload)
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    rule_id = _parse_optional_int(payload.get("id"), "id", 1)
+
+    conn = db_connect()
+    cur = conn.cursor()
+    try:
+        if rule_id is None:
+            cur.execute(
+                """
+                INSERT INTO alert_notification_rules(
+                    name, enabled, entity_types, metrics, severity_min, machine_names,
+                    trigger_mode, repeat_threshold, repeat_window_minutes, resend_mode, recipients,
+                    created_at, updated_at
+                ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                RETURNING id
+                """,
+                (
+                    fields["name"], fields["enabled"], fields["entity_types"], fields["metrics"],
+                    fields["severity_min"], fields["machine_names"], fields["trigger_mode"],
+                    fields["repeat_threshold"], fields["repeat_window_minutes"], fields["resend_mode"],
+                    fields["recipients"], now, now,
+                ),
+            )
+            rule_id = int(cur.fetchone()["id"])
+        else:
+            cur.execute(
+                """
+                UPDATE alert_notification_rules SET
+                    name=%s, enabled=%s, entity_types=%s, metrics=%s, severity_min=%s, machine_names=%s,
+                    trigger_mode=%s, repeat_threshold=%s, repeat_window_minutes=%s, resend_mode=%s,
+                    recipients=%s, updated_at=%s
+                WHERE id=%s
+                """,
+                (
+                    fields["name"], fields["enabled"], fields["entity_types"], fields["metrics"],
+                    fields["severity_min"], fields["machine_names"], fields["trigger_mode"],
+                    fields["repeat_threshold"], fields["repeat_window_minutes"], fields["resend_mode"],
+                    fields["recipients"], now, rule_id,
+                ),
+            )
+            if cur.rowcount == 0:
+                raise HTTPException(status_code=404, detail="rule not found")
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True, "id": rule_id}
+
+
+@app.post("/api/alert-rule-item/{rule_id}/delete")
+def delete_alert_rule_item(rule_id: int, x_api_key: Optional[str] = Header(default=None)):
+    require_api_key(x_api_key)
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM alert_notification_rules WHERE id=%s", (int(rule_id),))
+    deleted = cur.rowcount
+    conn.commit()
+    conn.close()
+    if deleted == 0:
+        raise HTTPException(status_code=404, detail="rule not found")
+    return {"ok": True}
+
+
+@app.get("/api/alert-rules/{rule_id}/notifications")
+def get_alert_rule_notifications(rule_id: int, limit: int = 20, x_api_key: Optional[str] = Header(default=None)):
+    require_api_key(x_api_key)
+    limit = max(1, min(int(limit), 200))
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM alert_notification_rules WHERE id=%s", (int(rule_id),))
+    if not cur.fetchone():
+        conn.close()
+        raise HTTPException(status_code=404, detail="rule not found")
+    cur.execute(
+        """
+        SELECT n.id, n.rule_id, n.alert_id, n.series_key, n.sent_at, n.status, n.error,
+               a.machine_name, a.metric, a.severity, a.process_name
+        FROM alert_notifications n
+        LEFT JOIN alerts a ON a.id = n.alert_id
+        WHERE n.rule_id = %s
+        ORDER BY n.sent_at DESC, n.id DESC
+        LIMIT %s
+        """,
+        (int(rule_id), limit),
+    )
+    items = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return {"items": items}
+
+
 @app.post("/api/process-catalog-item")
 def upsert_process_catalog_item(payload: Dict[str, Any] = Body(...), x_api_key: Optional[str] = Header(default=None)):
     require_api_key(x_api_key)
@@ -1323,6 +1559,7 @@ def _try_insert_alert(cur: DbCursor, alert: Dict[str, Any]) -> bool:
                 bucket_hour, dedup_key
             ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (dedup_key) DO NOTHING
+            RETURNING id
             """,
             (
                 alert["created_at"],
@@ -1353,9 +1590,201 @@ def _try_insert_alert(cur: DbCursor, alert: Dict[str, Any]) -> bool:
                 alert["dedup_key"],
             ),
             )
-        return cur.rowcount > 0
+            row = cur.fetchone()
+        if not row:
+            return False
+        # id нужен журналу email-уведомлений (alert_notifications.alert_id)
+        alert["id"] = int(row["id"])
+        return True
     except Exception:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Email-уведомления по алертам (эпик 5).
+# Вызывается синхронно из детектора сразу после успешной вставки алерта;
+# любая ошибка (БД, SMTP) гасится внутри — /api/ingest не должен падать.
+# ---------------------------------------------------------------------------
+
+def _make_alert_series_key(alert: Dict[str, Any]) -> str:
+    """Как _make_alert_dedup_key, но без bucket_hour: одна «серия» = одна сущность + метрика."""
+    if alert["entity_type"] == "process_chain":
+        return f"{alert['machine_name']}|{alert['user_name']}|{alert.get('chain_key') or ''}|{alert['metric']}"
+    return f"{alert['machine_name']}|{alert['user_name']}|{_binary_key(alert.get('sha256'), alert.get('exe_path'), alert.get('process_name') or '')}|{alert['metric']}"
+
+
+def _rule_matches_alert(rule: Dict[str, Any], alert: Dict[str, Any]) -> bool:
+    """NULL/пустой список в фильтре правила = любое значение подходит."""
+    entity_types = rule.get("entity_types") or []
+    if entity_types and str(alert.get("entity_type") or "") not in entity_types:
+        return False
+    metrics = rule.get("metrics") or []
+    if metrics and str(alert.get("metric") or "") not in metrics:
+        return False
+    machine_names = rule.get("machine_names") or []
+    if machine_names and str(alert.get("machine_name") or "") not in machine_names:
+        return False
+    severity_min = str(rule.get("severity_min") or "").strip()
+    if severity_min:
+        if SEVERITY_ORDER.get(str(alert.get("severity") or ""), -1) < SEVERITY_ORDER.get(severity_min, 0):
+            return False
+    return True
+
+
+def _count_series_alerts(cur: DbCursor, series_key: str, since_iso: Optional[str]) -> int:
+    """Число алертов этой серии (включая текущий). dedup_key = series_key|bucket_hour,
+    поэтому сравниваем префикс фиксированной длины (LIKE не подходит: в путях бывают '_' и '%')."""
+    prefix = series_key + "|"
+    if since_iso:
+        cur.execute(
+            "SELECT COUNT(*) AS c FROM alerts WHERE left(dedup_key, %s) = %s AND created_at >= %s",
+            (len(prefix), prefix, since_iso),
+        )
+    else:
+        cur.execute(
+            "SELECT COUNT(*) AS c FROM alerts WHERE left(dedup_key, %s) = %s",
+            (len(prefix), prefix),
+        )
+    row = cur.fetchone()
+    return int(row["c"] or 0) if row else 0
+
+
+def _smtp_settings() -> Optional[Dict[str, Any]]:
+    """Настройки SMTP только из окружения. None = не настроено (нет хоста или отправителя)."""
+    host = os.environ.get("SMTP_HOST", "").strip()
+    sender = os.environ.get("SMTP_FROM", "").strip()
+    if not host or not sender:
+        return None
+    try:
+        port = int(os.environ.get("SMTP_PORT", "").strip() or SMTP_PORT_DEFAULT)
+    except ValueError:
+        port = SMTP_PORT_DEFAULT
+    return {
+        "host": host,
+        "port": port,
+        "user": os.environ.get("SMTP_USER", "").strip(),
+        "password": os.environ.get("SMTP_PASSWORD", ""),
+        "sender": sender,
+    }
+
+
+def _build_alert_email(alert: Dict[str, Any], rule: Dict[str, Any]) -> Tuple[str, str]:
+    severity = str(alert.get("severity") or "")
+    metric = str(alert.get("metric") or "")
+    machine = str(alert.get("machine_name") or "")
+    subject = f"[monitoring] {severity} {metric} {machine}"
+
+    if alert.get("entity_type") == "process_chain":
+        entity_line = f"Цепочка: {alert.get('parent_process_name') or 'unknown'} -> {alert.get('process_name') or ''}"
+        if alert.get("chain_key"):
+            entity_line += f" ({alert.get('chain_key')})"
+    else:
+        entity_line = f"Процесс: {alert.get('process_name') or ''}"
+        if alert.get("pid") is not None:
+            entity_line += f" (pid {alert.get('pid')})"
+
+    lines = [
+        f"Правило: {rule.get('name') or ''}",
+        f"Уровень: {severity}",
+        f"Метрика: {metric}",
+        f"Машина: {machine}",
+        f"Пользователь: {alert.get('user_name') or ''}",
+        entity_line,
+        f"Время: {alert.get('sample_time') or alert.get('created_at') or ''}",
+        "",
+        f"Причина: {alert.get('reason') or ''}",
+    ]
+    base_url = str(_cfg_get("dashboard_base_url", "") or "").strip().rstrip("/")
+    if base_url:
+        lines += ["", f"Дашборд: {base_url}/ (вкладка «Аналитика», алерт #{alert.get('id')})"]
+    return subject, "\n".join(lines)
+
+
+def _send_alert_email(recipients: List[str], subject: str, body: str) -> None:
+    """Отправка через SMTP + STARTTLS. Бросает исключение при любой ошибке (в т.ч. если SMTP не настроен)."""
+    smtp = _smtp_settings()
+    if not smtp:
+        raise RuntimeError("SMTP не настроен")
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["Subject"] = subject
+    msg["From"] = smtp["sender"]
+    msg["To"] = ", ".join(recipients)
+    with smtplib.SMTP(smtp["host"], smtp["port"], timeout=SMTP_TIMEOUT_SECONDS) as server:
+        server.ehlo()
+        server.starttls()
+        server.ehlo()
+        if smtp["user"] and smtp["password"]:
+            server.login(smtp["user"], smtp["password"])
+        server.sendmail(smtp["sender"], list(recipients), msg.as_string())
+
+
+def _record_notification(cur: DbCursor, rule_id: int, alert_id: int, series_key: str,
+                         status: str, error: Optional[str]) -> None:
+    with cur.connection.transaction():
+        cur.execute(
+            """
+            INSERT INTO alert_notifications(rule_id, alert_id, series_key, sent_at, status, error)
+            VALUES(%s, %s, %s, %s, %s, %s)
+            """,
+            (rule_id, alert_id, series_key, datetime.now(timezone.utc).isoformat(timespec="seconds"),
+             status, (error or None)),
+        )
+
+
+def evaluate_and_send_notifications(cur: DbCursor, alert: Dict[str, Any]) -> int:
+    """Проверяет включённые правила для только что вставленного алерта (alert["id"] задан)
+    и отправляет письма. Возвращает число попыток отправки (успешных и нет)."""
+    alert_id = alert.get("id")
+    if alert_id is None:
+        return 0
+    series_key = _make_alert_series_key(alert)
+
+    with cur.connection.transaction():
+        cur.execute("SELECT * FROM alert_notification_rules WHERE enabled = true ORDER BY id")
+        rules = [dict(r) for r in cur.fetchall()]
+
+    attempts = 0
+    for rule in rules:
+        if not _rule_matches_alert(rule, alert):
+            continue
+
+        if rule.get("trigger_mode") == "repeat_count":
+            threshold = int(rule.get("repeat_threshold") or 0)
+            window = rule.get("repeat_window_minutes")
+            since_iso: Optional[str] = None
+            if window:
+                ref = _safe_parse_iso(str(alert.get("created_at") or "")) or datetime.now(timezone.utc)
+                since_iso = (ref - timedelta(minutes=int(window))).isoformat(timespec="seconds")
+            with cur.connection.transaction():
+                count = _count_series_alerts(cur, series_key, since_iso)
+            if count < threshold:
+                continue
+        elif rule.get("trigger_mode") != "immediate":
+            continue
+
+        if rule.get("resend_mode") != "every_occurrence":
+            with cur.connection.transaction():
+                cur.execute(
+                    "SELECT 1 FROM alert_notifications WHERE rule_id = %s AND series_key = %s AND status = 'sent' LIMIT 1",
+                    (rule["id"], series_key),
+                )
+                if cur.fetchone():
+                    continue
+
+        recipients = [str(x).strip() for x in (rule.get("recipients") or []) if str(x).strip()]
+        status, error = "sent", None
+        try:
+            if not recipients:
+                raise RuntimeError("нет получателей")
+            subject, body = _build_alert_email(alert, rule)
+            _send_alert_email(recipients, subject, body)
+        except Exception as e:
+            status = "failed"
+            error = str(e) or type(e).__name__
+            print(f"[notify] rule {rule['id']} alert {alert_id}: {error}", file=sys.stderr)
+        attempts += 1
+        _record_notification(cur, int(rule["id"]), int(alert_id), series_key, status, error)
+    return attempts
 
 
 def _load_parent_context(cur: DbCursor, latest: DbRow) -> Optional[Dict[str, Any]]:
@@ -2492,6 +2921,11 @@ def detect_alerts_for_ingested_events(events_payload: List[Dict[str, Any]]) -> i
             alert_row["dedup_key"] = _make_alert_dedup_key(alert_row)
             if _try_insert_alert(cur, alert_row):
                 inserted += 1
+                # email-уведомления (эпик 5): сбой почты/правил не должен ронять /api/ingest
+                try:
+                    evaluate_and_send_notifications(cur, alert_row)
+                except Exception as e:
+                    print(f"[notify] alert {alert_row.get('id')}: {type(e).__name__}: {e}", file=sys.stderr)
 
     conn.commit()
     conn.close()
