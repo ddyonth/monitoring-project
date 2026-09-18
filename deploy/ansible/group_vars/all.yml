@@ -23,4 +23,4 @@ monitoring_web_refresh_seconds: 120
 # Базовый URL дашборда для ссылки в email-уведомлениях (config.json:
 # dashboard_base_url; в коде переопределяется env MONITORING_DASHBOARD_URL).
 # Пустая строка = ссылки в письме нет. Пример: "http://monitoring.local:8000"
-monitoring_dashboard_base_url: ""
+monitoring_dashboard_base_url: "http://localhost:8000/"
