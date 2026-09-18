@@ -64,15 +64,21 @@ def wmi_get_pid_times(conn: sqlite3.Connection, pid: int) -> Tuple[Optional[str]
 
 def os_info() -> str:
     """
-    Человекочитаемое имя ОС из /etc/os-release (PRETTY_NAME, иначе NAME),
-    например «ALT Workstation 11.1 (Prometheus)». Если platform.freedesktop_os_release()
-    недоступен (Python < 3.10) или падает (нет /etc/os-release) — platform.platform().
+    Человекочитаемое имя ОС из /etc/os-release: PRETTY_NAME (иначе NAME) плюс
+    VERSION_ID, если он не пуст и ещё не входит в имя подстрокой. Примеры с реальных
+    машин: ALT — «ALT Workstation 11.1 (Prometheus)» (версия уже в имени, не дублируем),
+    Astra — «Astra Linux» + «1.7_x86-64» → «Astra Linux 1.7_x86-64».
+    Если platform.freedesktop_os_release() недоступен (Python < 3.10) или падает
+    (нет /etc/os-release) — platform.platform().
     """
     try:
         try:
             rel = platform.freedesktop_os_release()  # type: ignore[attr-defined]
             name = str(rel.get("PRETTY_NAME") or rel.get("NAME") or "").strip()
             if name:
+                version_id = str(rel.get("VERSION_ID") or "").strip()
+                if version_id and version_id not in name:
+                    name = f"{name} {version_id}"
                 return name
         except Exception:
             pass

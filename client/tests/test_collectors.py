@@ -227,6 +227,33 @@ class TestOsInfo:
                             lambda: {"NAME": "Astra Linux", "ID": "astra"}, raising=False)
         assert collectors_linux.os_info() == "Astra Linux"
 
+    def test_linux_os_info_alt_real_values_do_not_duplicate_version(self, monkeypatch):
+        """Реальный /etc/os-release ALT Workstation 11.1: VERSION_ID уже входит в PRETTY_NAME."""
+        monkeypatch.setattr(platform, "freedesktop_os_release",
+                            lambda: {"NAME": "ALT Workstation", "VERSION": "11.1", "ID": "altlinux",
+                                     "VERSION_ID": "11.1", "PRETTY_NAME": "ALT Workstation 11.1 (Prometheus)"},
+                            raising=False)
+        assert collectors_linux.os_info() == "ALT Workstation 11.1 (Prometheus)"
+
+    def test_linux_os_info_astra_real_values_append_version_id(self, monkeypatch):
+        """Реальный /etc/os-release Astra Linux 1.7: PRETTY_NAME без версии, VERSION_ID добавляется."""
+        monkeypatch.setattr(platform, "freedesktop_os_release",
+                            lambda: {"PRETTY_NAME": "Astra Linux", "NAME": "Astra Linux", "ID": "astra",
+                                     "ID_LIKE": "debian", "VERSION_ID": "1.7_x86-64",
+                                     "VERSION_CODENAME": "1.7_x86-64"},
+                            raising=False)
+        assert collectors_linux.os_info() == "Astra Linux 1.7_x86-64"
+
+    def test_linux_os_info_version_id_appended_to_name_fallback(self, monkeypatch):
+        monkeypatch.setattr(platform, "freedesktop_os_release",
+                            lambda: {"NAME": "Some OS", "VERSION_ID": "42"}, raising=False)
+        assert collectors_linux.os_info() == "Some OS 42"
+
+    def test_linux_os_info_empty_version_id_is_ignored(self, monkeypatch):
+        monkeypatch.setattr(platform, "freedesktop_os_release",
+                            lambda: {"PRETTY_NAME": "Some OS", "VERSION_ID": "  "}, raising=False)
+        assert collectors_linux.os_info() == "Some OS"
+
     def test_linux_os_info_empty_fields_fall_back_to_platform(self, monkeypatch):
         monkeypatch.setattr(platform, "freedesktop_os_release", lambda: {"PRETTY_NAME": "", "ID": "x"}, raising=False)
         assert collectors_linux.os_info() == platform.platform()
