@@ -46,6 +46,19 @@ RARE_MACHINE_THRESHOLD_DEFAULT = 2
 TIME_HIST_MIN_SAMPLES_DEFAULT = 20
 ONLINE_THRESHOLD_MINUTES_DEFAULT = 20
 
+# Дерево процессов (эпик 3, фаза A): защитный потолок глубины обхода вверх и вниз
+PROCESS_TREE_MAX_DEPTH_DEFAULT = 30
+
+# Эвристики структуры цепочек (process_chain): пороги подобраны по распределению
+# в реальных данных (см. отчёт по фазе A). Baseline считается по бинарнику
+# (корневому — для глубины, родительскому — для fan-out) по всем машинам за
+# alert_baseline_window_days.
+CHAIN_DEPTH_MARGIN_DEFAULT = 2            # depth_now > max(prior depths under root) + margin
+CHAIN_DEPTH_MIN_SESSIONS_DEFAULT = 10     # минимум прошлых сессий под корнем для baseline
+CHAIN_FANOUT_K_DEFAULT = 2.0              # fanout_now > max(prior fanout of parent binary) * K
+CHAIN_FANOUT_ABS_DEFAULT = 5              # ... и fanout_now > abs
+CHAIN_FANOUT_MIN_PARENTS_DEFAULT = 3      # минимум прошлых сессий родительского бинарника
+
 
 # Alerts (MVP) defaults
 
@@ -189,6 +202,8 @@ def ensure_schema() -> None:
 
     cur.execute("CREATE INDEX IF NOT EXISTS idx_events_session ON events(machine_name, pid, start_time, sample_time);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_events_sha ON events(sha256);")
+    # обход дерева потомков: на каждом уровне ищем детей по (machine_name, ppid)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_events_ppid ON events(machine_name, ppid);")
 
     # --- machine inventory/state
     cur.execute(
@@ -246,6 +261,8 @@ def ensure_schema() -> None:
         """
     )
     cur.execute("ALTER TABLE chain_catalog ADD COLUMN IF NOT EXISTS updated_at TEXT;")
+    # ручная разметка эксперта: ID техники MITRE ATT&CK (например "T1059"), без автоклассификации
+    cur.execute("ALTER TABLE chain_catalog ADD COLUMN IF NOT EXISTS attack_technique_id TEXT;")
 
     # --- roles (minimal)
     cur.execute(
@@ -332,6 +349,7 @@ def ensure_schema() -> None:
             chain_key TEXT,
 
             metric TEXT NOT NULL,               -- cpu_delta | io_delta | rss | net_conn_count | rarity | chain_rarity | time_anomaly
+                                                -- | role_type_mismatch | chain_depth_anomaly | chain_fanout_anomaly
             value DOUBLE PRECISION,
             baseline DOUBLE PRECISION,
             score DOUBLE PRECISION,
@@ -802,7 +820,7 @@ def get_chain_catalog(x_api_key: Optional[str] = Header(default=None)):
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT chain_key, chain_name, chain_type, description, updated_at
+        SELECT chain_key, chain_name, chain_type, description, attack_technique_id, updated_at
         FROM chain_catalog
         ORDER BY lower(chain_name), lower(chain_key)
         """
@@ -820,6 +838,11 @@ def upsert_chain_catalog_item(payload: Dict[str, Any] = Body(...), x_api_key: Op
     chain_name = str(payload.get("chain_name") or "").strip()
     chain_type = str(payload.get("chain_type") or "").strip()
     description = str(payload.get("description") or "").strip()
+    # attack_technique_id: ключ отсутствует в payload -> значение в БД не трогаем
+    # (дашборд фазы A поле ещё не знает и не должен затирать разметку);
+    # ключ есть (в т.ч. пустая строка) -> записываем, пустое -> NULL
+    technique_given = "attack_technique_id" in payload
+    attack_technique_id = str(payload.get("attack_technique_id") or "").strip() or None
 
     if not chain_key:
         raise HTTPException(status_code=400, detail="chain_key required")
@@ -832,15 +855,17 @@ def upsert_chain_catalog_item(payload: Dict[str, Any] = Body(...), x_api_key: Op
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO chain_catalog(chain_key, chain_name, chain_type, description, updated_at)
-        VALUES(%s, %s, %s, %s, %s)
+        INSERT INTO chain_catalog(chain_key, chain_name, chain_type, description, attack_technique_id, updated_at)
+        VALUES(%s, %s, %s, %s, %s, %s)
         ON CONFLICT(chain_key) DO UPDATE SET
             chain_name=excluded.chain_name,
             chain_type=excluded.chain_type,
             description=excluded.description,
+            attack_technique_id=CASE WHEN %s THEN excluded.attack_technique_id
+                                     ELSE chain_catalog.attack_technique_id END,
             updated_at=excluded.updated_at
         """,
-        (chain_key, chain_name, chain_type or None, description or None, now),
+        (chain_key, chain_name, chain_type or None, description or None, attack_technique_id, now, technique_given),
     )
     conn.commit()
     conn.close()
@@ -1533,6 +1558,370 @@ def _chain_in_catalog(cur: DbCursor, chain_key: str) -> bool:
     cur.execute("SELECT 1 FROM chain_catalog WHERE chain_key=%s LIMIT 1;", (chain_key,))
     return cur.fetchone() is not None
 
+
+# ---------------------------------------------------------------------------
+# Дерево процессов (эпик 3, фаза A)
+#
+# Узел дерева = сессия процесса (machine_name, pid, start_time). Связь
+# родитель -> потомок: тот же принцип, что в _load_parent_context /
+# _count_prior_chain_sessions / analytics_chains — по (machine_name, pid=ppid
+# потомка) И по времени: start_time родителя <= start_time потомка <= end_time
+# родителя (или end_time ещё не известен). Из нескольких кандидатов с одним pid,
+# удовлетворяющих условию (pid переиспользован, а end_time старого не записан),
+# берётся тот, что стартовал ПОЗЖЕ всех, но не позже потомка (как в
+# analytics_chains): NOT EXISTS более поздней сессии с тем же pid, начавшейся
+# до потомка. Это даёт ровно одного родителя на потомка внутри одного
+# SQL-запроса WITH RECURSIVE, без цикла запросов в Python.
+#
+# end_time сессии берётся как MAX(end_time) по её сэмплам (агент пишет end_time
+# в финальный сэмпл), ppid — из последнего сэмпла.
+# ---------------------------------------------------------------------------
+
+def _tree_max_depth() -> int:
+    try:
+        return max(1, int(_cfg_get("process_tree_max_depth", PROCESS_TREE_MAX_DEPTH_DEFAULT)))
+    except Exception:
+        return PROCESS_TREE_MAX_DEPTH_DEFAULT
+
+
+def _node_id(pid: Any, start_time: Any) -> str:
+    return f"{int(pid or 0)}|{start_time}"
+
+
+def _binary_match_sql(sha256: str, exe_path: str, process_name: str, alias: str = "") -> Tuple[str, List[Any]]:
+    """Условие "тот же бинарник", как в _count_prior_binary_sessions / _typical_hours_for_process."""
+    a = f"{alias}." if alias else ""
+    if sha256:
+        return f"NULLIF({a}sha256, '') IS NOT NULL AND {a}sha256=%s", [sha256]
+    if exe_path:
+        return f"lower(COALESCE({a}exe_path, ''))=%s", [exe_path.lower()]
+    return f"lower({a}process_name)=%s", [(process_name or "").lower()]
+
+
+# сравнение времени в SQL — строковое, как в _count_prior_chain_sessions
+# (даты хранятся ISO-строками одного формата от агента)
+_SESSION_END_SQL = """(SELECT MAX(NULLIF(e.end_time, '')) FROM events e
+                        WHERE e.machine_name = {p}.machine_name AND e.pid = {p}.pid AND e.start_time = {p}.start_time)"""
+
+
+def _descendant_rows(
+    cur: DbCursor,
+    seed_sql: str,
+    seed_params: List[Any],
+    max_depth: int,
+    since_iso: Optional[str] = None,
+    until_iso: Optional[str] = None,
+) -> List[DbRow]:
+    """
+    Обход потомков вниз от "семян" (seed_sql возвращает machine_name, pid,
+    start_time; уровень 0). Возвращает строки (machine_name, pid, start_time,
+    parent_pid, parent_start, depth); depth <= max_depth + 1 — строки уровня
+    max_depth + 1 нужны только чтобы понять, что потолок достигнут.
+    since/until ограничивают сэмплы потомков (окно baseline); семена не ограничивают.
+    """
+    win_sql = ""
+    win_params: List[Any] = []
+    if since_iso:
+        win_sql += " AND c.sample_time >= %s"
+        win_params.append(since_iso)
+    if until_iso:
+        win_sql += " AND c.sample_time < %s"
+        win_params.append(until_iso)
+
+    cur.execute(
+        f"""
+        WITH RECURSIVE down AS (
+            SELECT seed.machine_name, seed.pid, seed.start_time,
+                   NULL::integer AS parent_pid, NULL::text AS parent_start,
+                   0 AS depth,
+                   ARRAY[seed.pid::text || '|' || seed.start_time] AS path
+            FROM ({seed_sql}) AS seed
+            UNION
+            SELECT c.machine_name, c.pid, c.start_time,
+                   d.pid, d.start_time,
+                   d.depth + 1,
+                   d.path || (c.pid::text || '|' || c.start_time)
+            FROM down d
+            JOIN events c
+              ON c.machine_name = d.machine_name
+             AND c.ppid = d.pid
+            WHERE d.depth <= %s
+              AND c.pid IS NOT NULL
+              AND NOT (c.pid = d.pid AND c.start_time = d.start_time)
+              AND NOT ((c.pid::text || '|' || c.start_time) = ANY(d.path))
+              -- перекрытие по времени: start родителя <= start потомка <= end родителя (или end неизвестен)
+              AND c.start_time >= d.start_time
+              AND COALESCE({_SESSION_END_SQL.format(p="d")} >= c.start_time, TRUE)
+              -- pid переиспользован: родитель — самая поздняя сессия с этим pid, начавшаяся не позже потомка
+              AND NOT EXISTS (SELECT 1 FROM events p2
+                              WHERE p2.machine_name = c.machine_name AND p2.pid = c.ppid
+                                AND p2.start_time > d.start_time AND p2.start_time <= c.start_time)
+              {win_sql}
+        )
+        SELECT machine_name, pid, start_time, parent_pid, parent_start, depth
+        FROM down
+        ORDER BY depth, machine_name, start_time, pid
+        """,
+        list(seed_params) + [int(max_depth)] + win_params,
+    )
+    return [dict(r) for r in cur.fetchall()]
+
+
+def _ancestor_rows(cur: DbCursor, machine: str, pid: int, start_time: str, max_depth: int) -> List[DbRow]:
+    """
+    Путь предков вверх от сессии (уровень 0 — сама сессия). Строки
+    (machine_name, pid, start_time, ppid, depth), depth <= max_depth + 1.
+    Правило выбора родителя то же, что в _descendant_rows.
+    """
+    cur.execute(
+        f"""
+        WITH RECURSIVE up AS (
+            SELECT seed.machine_name, seed.pid, seed.start_time, seed.ppid,
+                   0 AS depth,
+                   ARRAY[seed.pid::text || '|' || seed.start_time] AS path
+            FROM (SELECT DISTINCT ON (machine_name, pid, start_time) machine_name, pid, start_time, ppid
+                  FROM events
+                  WHERE machine_name = %s AND pid = %s AND start_time = %s
+                  ORDER BY machine_name, pid, start_time, sample_time DESC) AS seed
+            UNION
+            SELECT p.machine_name, p.pid, p.start_time,
+                   (SELECT e.ppid FROM events e
+                     WHERE e.machine_name = p.machine_name AND e.pid = p.pid AND e.start_time = p.start_time
+                     ORDER BY e.sample_time DESC LIMIT 1) AS ppid,
+                   u.depth + 1,
+                   u.path || (p.pid::text || '|' || p.start_time)
+            FROM up u
+            JOIN events p
+              ON p.machine_name = u.machine_name
+             AND p.pid = u.ppid
+            WHERE u.depth <= %s
+              AND u.ppid IS NOT NULL
+              AND NOT (p.pid = u.pid AND p.start_time = u.start_time)
+              AND NOT ((p.pid::text || '|' || p.start_time) = ANY(u.path))
+              AND p.start_time <= u.start_time
+              AND COALESCE({_SESSION_END_SQL.format(p="p")} >= u.start_time, TRUE)
+              AND NOT EXISTS (SELECT 1 FROM events p2
+                              WHERE p2.machine_name = p.machine_name AND p2.pid = p.pid
+                                AND p2.start_time > p.start_time AND p2.start_time <= u.start_time)
+        )
+        SELECT machine_name, pid, start_time, ppid, depth
+        FROM up
+        ORDER BY depth
+        """,
+        (machine, int(pid), start_time, int(max_depth)),
+    )
+    return [dict(r) for r in cur.fetchall()]
+
+
+def _load_session_nodes(cur: DbCursor, machine: str, node_ids: List[str]) -> Dict[str, DbRow]:
+    """Последний сэмпл каждой сессии (по node_id = "pid|start_time") одной машины."""
+    if not node_ids:
+        return {}
+    cur.execute(
+        """
+        SELECT DISTINCT ON (pid, start_time)
+               machine_name, user_name, process_name, pid, ppid, exe_path, sha256,
+               start_time, sample_time, end_time, duration_seconds
+        FROM events
+        WHERE machine_name = %s
+          AND (COALESCE(pid, 0)::text || '|' || start_time) = ANY(%s)
+        ORDER BY pid, start_time, sample_time DESC
+        """,
+        (machine, list(node_ids)),
+    )
+    out: Dict[str, DbRow] = {}
+    for r in cur.fetchall():
+        out[_node_id(r["pid"], r["start_time"])] = dict(r)
+    return out
+
+
+def build_process_tree(cur: DbCursor, machine: str, pid: int, start_time: str, max_depth: int) -> Optional[Dict[str, Any]]:
+    """
+    Предки до корня + поддерево потомков от узла (machine, pid, start_time).
+    None — если такой сессии нет. Потолок глубины max_depth действует отдельно
+    вверх и вниз; при достижении выставляются флаги truncated.
+    """
+    root_id = _node_id(pid, start_time)
+    up = _ancestor_rows(cur, machine, pid, start_time, max_depth)
+    if not up:
+        return None
+
+    ancestors_truncated = any(int(r["depth"]) > max_depth for r in up)
+    up = [r for r in up if int(r["depth"]) <= max_depth]
+
+    down = _descendant_rows(
+        cur,
+        "SELECT %s::text AS machine_name, %s::integer AS pid, %s::text AS start_time",
+        [machine, int(pid), start_time],
+        max_depth,
+    )
+    descendants_truncated = any(int(r["depth"]) > max_depth for r in down)
+    down = [r for r in down if int(r["depth"]) <= max_depth]
+
+    # связи: parent_id для каждого узла
+    parent_of: Dict[str, Optional[str]] = {}
+    level_of: Dict[str, int] = {}
+    ancestor_ids: List[str] = []
+    prev_id: Optional[str] = None
+    for r in up:  # depth 0 = сам узел, дальше вверх
+        nid = _node_id(r["pid"], r["start_time"])
+        level_of[nid] = -int(r["depth"])
+        if prev_id is not None:
+            parent_of[prev_id] = nid
+        if r["depth"] > 0:
+            ancestor_ids.append(nid)
+        prev_id = nid
+    if prev_id is not None:
+        parent_of.setdefault(prev_id, None)
+
+    for r in down:
+        nid = _node_id(r["pid"], r["start_time"])
+        if int(r["depth"]) == 0:
+            continue
+        level_of[nid] = int(r["depth"])
+        parent_of[nid] = _node_id(r["parent_pid"], r["parent_start"])
+
+    children_of: Dict[str, List[str]] = {}
+    for nid, pid_ in parent_of.items():
+        if pid_ is not None:
+            children_of.setdefault(pid_, []).append(nid)
+
+    order = list(reversed(ancestor_ids)) + [root_id] + [
+        _node_id(r["pid"], r["start_time"]) for r in down if int(r["depth"]) > 0
+    ]
+    details = _load_session_nodes(cur, machine, order)
+
+    nodes: List[Dict[str, Any]] = []
+    for nid in order:
+        d = details.get(nid) or {}
+        nodes.append({
+            "node_id": nid,
+            "parent_id": parent_of.get(nid),
+            "children_ids": children_of.get(nid, []),
+            "level": level_of.get(nid, 0),
+            "is_root": nid == root_id,
+            "machine_name": machine,
+            "process_name": d.get("process_name"),
+            "user_name": d.get("user_name"),
+            "pid": d.get("pid"),
+            "ppid": d.get("ppid"),
+            "start_time": d.get("start_time"),
+            "end_time": d.get("end_time") or None,
+            "sha256": d.get("sha256") or None,
+            "exe_path": d.get("exe_path") or None,
+            "sample_time": d.get("sample_time"),
+            "duration_seconds": d.get("duration_seconds"),
+        })
+
+    return {
+        "root": {"node_id": root_id, "machine_name": machine, "pid": int(pid), "start_time": start_time},
+        "max_depth": int(max_depth),
+        "truncated": bool(ancestors_truncated or descendants_truncated),
+        "ancestors_truncated": bool(ancestors_truncated),
+        "descendants_truncated": bool(descendants_truncated),
+        "ancestor_ids": ancestor_ids,  # от родителя вверх к корню
+        "nodes": nodes,               # предки сверху вниз, корень, потомки по уровням
+    }
+
+
+
+# ---------------------------------------------------------------------------
+# Эвристики структуры цепочек: аномальная глубина и аномальный fan-out
+# ---------------------------------------------------------------------------
+
+def _chain_depth_context(cur: DbCursor, machine: str, pid: int, start_time: str) -> Optional[Dict[str, Any]]:
+    """
+    Глубина текущей сессии (число предков) и её корень (верхний найденный предок).
+    None — если предков нет или потолок обхода достигнут (корень неизвестен).
+    """
+    cap = _tree_max_depth()
+    up = _ancestor_rows(cur, machine, pid, start_time, cap)
+    if not up or any(int(r["depth"]) > cap for r in up):
+        return None
+    if len(up) < 2:
+        return None
+    top = up[-1]
+    lineage = {_node_id(r["pid"], r["start_time"]) for r in up}
+    root_nodes = _load_session_nodes(cur, machine, [_node_id(top["pid"], top["start_time"])])
+    root = root_nodes.get(_node_id(top["pid"], top["start_time"])) or {}
+    root_sha = str(root.get("sha256") or "").strip()
+    root_exe = str(root.get("exe_path") or "").strip()
+    root_name = str(root.get("process_name") or "").strip()
+    return {
+        "depth": len(up) - 1,
+        "lineage_ids": lineage,
+        "root_process_name": root_name,
+        "root_key": _binary_key(root_sha, root_exe, root_name),
+        "root_match": (root_sha, root_exe, root_name),
+    }
+
+
+def _sessions_of_binary_seed_sql(sha256: str, exe_path: str, process_name: str, since_iso: str, until_iso: str) -> Tuple[str, List[Any]]:
+    """Семена обхода: все сессии данного бинарника (все машины) с сэмплами в окне."""
+    match_sql, params = _binary_match_sql(sha256, exe_path, process_name)
+    sql = f"""SELECT DISTINCT machine_name, pid, start_time
+              FROM events
+              WHERE pid IS NOT NULL AND {match_sql}
+                AND sample_time >= %s AND sample_time < %s"""
+    return sql, params + [since_iso, until_iso]
+
+
+def _chain_depth_baseline_rows(
+    cur: DbCursor, root_match: Tuple[str, str, str], since_iso: str, until_iso: str
+) -> List[DbRow]:
+    """
+    Все потомки всех сессий корневого бинарника в окне: (machine, pid, start_time, depth).
+    Сессия того же бинарника может быть вложена в другую (systemd -> systemd --user):
+    тогда узел приходит дважды с разной глубиной — оставляем максимальную, т.е.
+    глубину от самого верхнего корня (так же считается depth текущей сессии).
+    """
+    seed_sql, seed_params = _sessions_of_binary_seed_sql(*root_match, since_iso, until_iso)
+    rows = _descendant_rows(cur, seed_sql, seed_params, _tree_max_depth(), since_iso, until_iso)
+    best: Dict[Tuple[str, str], DbRow] = {}
+    for r in rows:
+        k = (str(r["machine_name"]), _node_id(r["pid"], r["start_time"]))
+        if k not in best or int(r["depth"]) > int(best[k]["depth"]):
+            best[k] = r
+    return list(best.values())
+
+
+def _chain_fanout_baseline(
+    cur: DbCursor, parent_match: Tuple[str, str, str], since_iso: str, until_iso: str
+) -> Dict[Tuple[str, str], int]:
+    """Число детей у каждой сессии родительского бинарника (все машины) в окне."""
+    seed_sql, seed_params = _sessions_of_binary_seed_sql(*parent_match, since_iso, until_iso)
+    rows = _descendant_rows(cur, seed_sql, seed_params, 1, since_iso, until_iso)
+    counts: Dict[Tuple[str, str], int] = {}
+    for r in rows:
+        if int(r["depth"]) == 0:
+            counts.setdefault((str(r["machine_name"]), _node_id(r["pid"], r["start_time"])), 0)
+        elif int(r["depth"]) == 1:
+            k = (str(r["machine_name"]), _node_id(r["parent_pid"], r["parent_start"]))
+            counts[k] = counts.get(k, 0) + 1
+    return counts
+
+
+def _chain_fanout_now(cur: DbCursor, machine: str, pid: int, start_time: str) -> int:
+    """Текущее число детей у одной сессии (без окна: все её дети, записанные к этому моменту)."""
+    rows = _descendant_rows(
+        cur,
+        "SELECT %s::text AS machine_name, %s::integer AS pid, %s::text AS start_time",
+        [machine, int(pid), start_time],
+        1,
+    )
+    return sum(1 for r in rows if int(r["depth"]) == 1)
+
+
+def _find_parent_session(cur: DbCursor, machine: str, pid: int, start_time: str) -> Optional[DbRow]:
+    """Родительская сессия (последний сэмпл) по тому же правилу, что и обход дерева."""
+    up = _ancestor_rows(cur, machine, pid, start_time, 1)
+    parents = [r for r in up if int(r["depth"]) == 1]
+    if not parents:
+        return None
+    nid = _node_id(parents[0]["pid"], parents[0]["start_time"])
+    return _load_session_nodes(cur, machine, [nid]).get(nid)
+
+
 def _get_machine_role_profile(cur: DbCursor, machine_name: str) -> Optional[Dict[str, Any]]:
     cur.execute(
         """
@@ -1717,10 +2106,20 @@ def detect_alerts_for_ingested_events(events_payload: List[Dict[str, Any]]) -> i
     days = int(_cfg_get("alert_baseline_window_days", ALERT_BASELINE_WINDOW_DAYS_DEFAULT))
     nmin = int(_cfg_get("alert_baseline_min_points", ALERT_BASELINE_MIN_POINTS_DEFAULT))
     rare_thr = int(_cfg_get("rare_count_threshold", RARE_COUNT_THRESHOLD_DEFAULT))
+    depth_margin = int(_cfg_get("chain_depth_margin", CHAIN_DEPTH_MARGIN_DEFAULT))
+    depth_min_sessions = int(_cfg_get("chain_depth_min_sessions", CHAIN_DEPTH_MIN_SESSIONS_DEFAULT))
+    fanout_k = float(_cfg_get("chain_fanout_k", CHAIN_FANOUT_K_DEFAULT))
+    fanout_abs = int(_cfg_get("chain_fanout_abs", CHAIN_FANOUT_ABS_DEFAULT))
+    fanout_min_parents = int(_cfg_get("chain_fanout_min_parents", CHAIN_FANOUT_MIN_PARENTS_DEFAULT))
 
     conn = db_connect()
     cur = conn.cursor()
     inserted = 0
+
+    # baseline глубины/fan-out по бинарнику одинаков для всех сессий пакета —
+    # считаем один раз на вызов (обход от всех сессий бинарника за окно)
+    depth_baseline_memo: Dict[str, List[DbRow]] = {}
+    fanout_baseline_memo: Dict[str, Dict[Tuple[str, str], int]] = {}
 
     for (machine, pid, start_time), current_sample in newest.items():
         latest, prev = _get_latest_and_prev_for_session(cur, machine, pid, start_time, current_sample)
@@ -1908,6 +2307,111 @@ def detect_alerts_for_ingested_events(events_payload: List[Dict[str, Any]]) -> i
                         "status": "new",
                         "bucket_hour": bucket_hour,
                     })
+
+        # --- 3.1 аномальная глубина цепочки (per корневой бинарник).
+        # Не подавляется chain_catalog: справочник описывает допустимость ребра
+        # parent->child, а глубина — свойство всей цепочки, которая может целиком
+        # состоять из "известных" рёбер.
+        if parent_ctx:
+            depth_ctx = _chain_depth_context(cur, machine, pid, start_time)
+            if depth_ctx and depth_ctx["depth"] > 0:
+                rk = depth_ctx["root_key"]
+                if rk not in depth_baseline_memo:
+                    depth_baseline_memo[rk] = _chain_depth_baseline_rows(cur, depth_ctx["root_match"], since_iso, until_iso)
+                # "прошлые" сессии под этим корнем: не сама сессия, не её линия предков
+                # (их глубины по построению = depth-1, depth-2, ...), стартовавшие раньше неё
+                prior_depths = [
+                    int(r["depth"]) for r in depth_baseline_memo[rk]
+                    if not (str(r["machine_name"]) == machine and _node_id(r["pid"], r["start_time"]) in depth_ctx["lineage_ids"])
+                    and str(r["start_time"]) < start_time
+                    and int(r["depth"]) > 0
+                ]
+                depth_now = int(depth_ctx["depth"])
+                if len(prior_depths) >= depth_min_sessions:
+                    baseline_depth = max(prior_depths)
+                    if depth_now > baseline_depth + depth_margin:
+                        excess = depth_now - baseline_depth
+                        sev = "high" if excess > 2 * depth_margin else "med"
+                        session_alerts.append({
+                            "created_at": now_iso,
+                            "sample_time": until_iso,
+                            "machine_name": machine,
+                            "user_name": user_name,
+                            "entity_type": "process_chain",
+                            "process_name": process_name,
+                            "pid": int(latest["pid"] or 0) if latest["pid"] is not None else None,
+                            "start_time": str(latest["start_time"]) if latest["start_time"] is not None else None,
+                            "sha256": sha256 or None,
+                            "exe_path": exe_path or None,
+                            "parent_process_name": parent_ctx["parent_process_name"],
+                            "parent_sha256": parent_ctx["parent_sha256"],
+                            "parent_exe_path": parent_ctx["parent_exe_path"],
+                            "chain_key": str(parent_ctx["chain_key"] or ""),
+                            "metric": "chain_depth_anomaly",
+                            "value": float(depth_now),
+                            "baseline": float(baseline_depth),
+                            "score": float(excess),
+                            "severity": sev,
+                            "reason": (
+                                f"Аномальная глубина цепочки: {depth_now} уровней от корня "
+                                f"{depth_ctx['root_process_name'] or 'unknown'}; типичный максимум для этого корня "
+                                f"{baseline_depth} (порог {baseline_depth + depth_margin}, наблюдений {len(prior_depths)})."
+                            ),
+                            "status": "new",
+                            "bucket_hour": bucket_hour,
+                        })
+
+        # --- 3.2 аномальный fan-out родительской сессии (per родительский бинарник).
+        # Алерт привязан к родительской сессии (pid/start_time = родитель), чтобы
+        # дерево от алерта показывало сам "веер"; chain_key = "<parent_key> -> *"
+        # (дедуп на родителя, а не на пару parent->child). chain_catalog не
+        # подавляет по той же причине, что и глубину.
+        if parent_ctx:
+            parent_sess = _find_parent_session(cur, machine, pid, start_time)
+            if parent_sess:
+                p_sha = str(parent_sess.get("sha256") or "").strip()
+                p_exe = str(parent_sess.get("exe_path") or "").strip()
+                p_name = str(parent_sess.get("process_name") or "").strip()
+                p_key = _binary_key(p_sha, p_exe, p_name)
+                if p_key not in fanout_baseline_memo:
+                    fanout_baseline_memo[p_key] = _chain_fanout_baseline(cur, (p_sha, p_exe, p_name), since_iso, until_iso)
+                p_pid = int(parent_sess["pid"] or 0)
+                p_start = str(parent_sess["start_time"])
+                p_id = (machine, _node_id(p_pid, p_start))
+                prior_fanouts = [v for k, v in fanout_baseline_memo[p_key].items() if k != p_id]
+                if len(prior_fanouts) >= fanout_min_parents:
+                    fanout_now = _chain_fanout_now(cur, machine, p_pid, p_start)
+                    baseline_fanout = max(prior_fanouts)
+                    if fanout_now > baseline_fanout * fanout_k and fanout_now > fanout_abs:
+                        ratio = (float(fanout_now) / float(baseline_fanout)) if baseline_fanout > 0 else None
+                        session_alerts.append({
+                            "created_at": now_iso,
+                            "sample_time": until_iso,
+                            "machine_name": machine,
+                            "user_name": str(parent_sess.get("user_name") or "").strip() or user_name,
+                            "entity_type": "process_chain",
+                            "process_name": p_name or "unknown",
+                            "pid": p_pid,
+                            "start_time": p_start,
+                            "sha256": p_sha or None,
+                            "exe_path": p_exe or None,
+                            "parent_process_name": None,
+                            "parent_sha256": None,
+                            "parent_exe_path": None,
+                            "chain_key": f"{p_key} -> *",
+                            "metric": "chain_fanout_anomaly",
+                            "value": float(fanout_now),
+                            "baseline": float(baseline_fanout),
+                            "score": (float(ratio) if ratio is not None else None),
+                            "severity": _severity_from_ratio(ratio),
+                            "reason": (
+                                f"Аномальный fan-out: у процесса {p_name or 'unknown'} (pid={p_pid}) уже {fanout_now} дочерних "
+                                f"процессов (последний — {process_name}); типичный максимум для этого бинарника "
+                                f"{baseline_fanout} по {len(prior_fanouts)} сессиям (порог: >{baseline_fanout * fanout_k:g} и >{fanout_abs})."
+                            ),
+                            "status": "new",
+                            "bucket_hour": bucket_hour,
+                        })
 
         role_profile = _get_machine_role_profile(cur, machine)
         if role_profile:
@@ -2589,6 +3093,50 @@ def analytics_chains(
         items = [item for item in items if chain_filter in (item.get("chain_keys") or [])]
 
     return {"window_days": days, "items": items}
+
+@app.get("/api/analytics/process-tree")
+def analytics_process_tree(
+    x_api_key: Optional[str] = Header(default=None),
+    machine_name: str = "",
+    pid: int = 0,
+    start_time: str = "",
+    alert_id: int = 0,
+    max_depth: int = 0,
+):
+    """
+    Дерево процессов от одного узла: предки до корня + потомки вниз.
+    Корень задаётся либо координатами сессии (machine_name, pid, start_time —
+    как у строк /api/latest), либо alert_id (координаты берутся из алерта).
+    max_depth — необязательное сужение потолка (не больше настроенного).
+    """
+    require_api_key(x_api_key)
+
+    ceiling = _tree_max_depth()
+    depth_cap = ceiling if int(max_depth or 0) <= 0 else max(1, min(int(max_depth), ceiling))
+
+    conn = db_connect()
+    cur = conn.cursor()
+    try:
+        if int(alert_id or 0) > 0:
+            cur.execute("SELECT machine_name, pid, start_time FROM alerts WHERE id=%s", (int(alert_id),))
+            a = cur.fetchone()
+            if not a:
+                raise HTTPException(status_code=404, detail="alert not found")
+            machine_name = str(a["machine_name"] or "")
+            pid = int(a["pid"] or 0)
+            start_time = str(a["start_time"] or "")
+
+        machine = machine_name.strip()
+        start = start_time.strip()
+        if not machine or not start or int(pid or 0) <= 0:
+            raise HTTPException(status_code=400, detail="machine_name, pid and start_time (or alert_id) required")
+
+        tree = build_process_tree(cur, machine, int(pid), start, depth_cap)
+        if tree is None:
+            raise HTTPException(status_code=404, detail="process session not found")
+        return tree
+    finally:
+        conn.close()
 
 
 # Alerts API (MVP)
