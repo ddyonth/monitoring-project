@@ -250,6 +250,14 @@ function getProcType(name) {
 
   // Column catalog
   const PROC_COLS = {
+    // точка входа в граф цепочки (эпик 3, фаза C): строки running и stopped
+    // приходят из events (e.*), поэтому machine_name/pid/start_time есть в ev
+    tree: {
+      title: "Цепочка",
+      cell: (ev) => `<td><button data-proc-graph="1" title="Посмотреть цепочку процесса на вкладке «Графы»"
+        data-graph-machine="${escapeHtml(ev.machine_name || "")}" data-graph-pid="${escapeHtml(ev.pid ?? "")}" data-graph-start="${escapeHtml(ev.start_time || "")}" data-graph-name="${escapeHtml(ev.process_name || "")}"
+        style="padding:2px 8px; border-radius:999px; border:1px solid #ddd; cursor:pointer;">🌳</button></td>`
+    },
     type: {
       title: "Тип",
       cell: (ev) => `<td class="muted">${escapeHtml(getProcType(ev.process_name))}</td>`
@@ -317,7 +325,7 @@ function getProcType(name) {
     const cols = Array.from(wrap.querySelectorAll('input[type="checkbox"][data-col]'))
       .filter(cb => cb.checked)
       .map(cb => cb.dataset.col);
-    return cols.length ? cols : ["user", "start", "duration", "pid"];
+    return cols.length ? cols : ["tree", "user", "start", "duration", "pid"];
   }
 
   // Filtering and sorting
@@ -824,6 +832,7 @@ function getProcType(name) {
   function renderMachineCard(item) {
     const card = document.createElement("div");
     card.className = "card";
+    card.dataset.machineName = String(item.machine_name || "");
 
     const head = document.createElement("div");
     head.className = "machineHeader";
@@ -2374,7 +2383,7 @@ function getProcType(name) {
       if (selected) machineSel.value = selected;
     }
 
-    async function loadProcesses(machine, selectedValue) {
+    async function loadProcesses(machine, selectedValue, selectedName) {
       procSel.innerHTML = `<option value="">(загрузка...)</option>`;
       if (!latestCache) latestCache = await apiGetJson("/api/latest");
       const mrow = (latestCache.latest || []).find(x => (x.machine_name || "") === machine);
@@ -2388,8 +2397,10 @@ function getProcType(name) {
       }).join("");
       if (selectedValue) {
         if (!running.some(ev => grNodeId(ev.pid, ev.start_time) === selectedValue)) {
-          // процесс из карточки уже не в «запущенных» — всё равно даём построить дерево по его координатам
-          procSel.insertAdjacentHTML("beforeend", `<option value="${escapeHtml(selectedValue)}">${escapeHtml("pid " + selectedValue.replace("|", ", старт "))} (не в текущем срезе)</option>`);
+          // процесс из карточки уже не в «запущенных» (завершён) — всё равно даём построить дерево по его координатам
+          const i = selectedValue.indexOf("|");
+          const label = `${selectedName || "процесс"} (pid ${selectedValue.slice(0, i)}, с ${fmtLocalTs(selectedValue.slice(i + 1))}, не в текущем срезе)`;
+          procSel.insertAdjacentHTML("beforeend", `<option value="${escapeHtml(selectedValue)}">${escapeHtml(label)}</option>`);
         }
         procSel.value = selectedValue;
       }
@@ -2479,7 +2490,7 @@ function getProcType(name) {
       } else {
         await loadMachines(preset ? preset.machine : "");
         if (preset && preset.machine) {
-          await loadProcesses(preset.machine, preset.pid != null ? grNodeId(preset.pid, preset.start_time) : "");
+          await loadProcesses(preset.machine, preset.pid != null ? grNodeId(preset.pid, preset.start_time) : "", preset.process_name || "");
           if (preset.pid != null) await buildFromProcess();
         }
       }
@@ -2488,15 +2499,29 @@ function getProcType(name) {
     }
   }
 
+  // Мониторинг → Графы: кнопка «🌳» в колонке «Цепочка» таблиц процессов
+  document.addEventListener("click", async (e) => {
+    const btn = e.target && e.target.closest ? e.target.closest('button[data-proc-graph="1"]') : null;
+    if (!btn) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const card = btn.closest(".card");
+    const machine = btn.dataset.graphMachine || (card ? card.dataset.machineName : "") || "";
+    const pid = btn.dataset.graphPid || "";
+    const start = btn.dataset.graphStart || "";
+    if (!machine || !pid || !start) return;
+    await openGraphForProcess(machine, Number(pid), start, btn.dataset.graphName || "");
+  });
+
   // Точки входа с других вкладок (фаза C)
   async function openGraphForAlert(alertId, alertObj) {
     setActiveTab("graphs");
     await renderGraphs({ mode: "alert", alertId, alert: alertObj || null });
   }
 
-  async function openGraphForProcess(machineName, pid, startTime) {
+  async function openGraphForProcess(machineName, pid, startTime, processName) {
     setActiveTab("graphs");
-    await renderGraphs({ mode: "process", machine: machineName, pid, start_time: startTime });
+    await renderGraphs({ mode: "process", machine: machineName, pid, start_time: startTime, process_name: processName || "" });
   }
 
   // prevent auto-refresh from spamming while not on Monitoring (safe)
