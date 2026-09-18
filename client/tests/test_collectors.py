@@ -216,8 +216,63 @@ class TestWmiStubs:
 
 
 class TestOsInfo:
-    def test_linux_os_info_is_platform_string(self):
+    def test_linux_os_info_uses_pretty_name(self, monkeypatch):
+        monkeypatch.setattr(platform, "freedesktop_os_release",
+                            lambda: {"NAME": "ALT Workstation", "PRETTY_NAME": "ALT Workstation 11.1 (Prometheus)",
+                                     "ID": "altlinux"}, raising=False)
+        assert collectors_linux.os_info() == "ALT Workstation 11.1 (Prometheus)"
+
+    def test_linux_os_info_falls_back_to_name(self, monkeypatch):
+        monkeypatch.setattr(platform, "freedesktop_os_release",
+                            lambda: {"NAME": "Astra Linux", "ID": "astra"}, raising=False)
+        assert collectors_linux.os_info() == "Astra Linux"
+
+    def test_linux_os_info_alt_real_values_do_not_duplicate_version(self, monkeypatch):
+        """Реальный /etc/os-release ALT Workstation 11.1: VERSION_ID уже входит в PRETTY_NAME."""
+        monkeypatch.setattr(platform, "freedesktop_os_release",
+                            lambda: {"NAME": "ALT Workstation", "VERSION": "11.1", "ID": "altlinux",
+                                     "VERSION_ID": "11.1", "PRETTY_NAME": "ALT Workstation 11.1 (Prometheus)"},
+                            raising=False)
+        assert collectors_linux.os_info() == "ALT Workstation 11.1 (Prometheus)"
+
+    def test_linux_os_info_astra_real_values_append_version_id(self, monkeypatch):
+        """Реальный /etc/os-release Astra Linux 1.7: PRETTY_NAME без версии, VERSION_ID добавляется."""
+        monkeypatch.setattr(platform, "freedesktop_os_release",
+                            lambda: {"PRETTY_NAME": "Astra Linux", "NAME": "Astra Linux", "ID": "astra",
+                                     "ID_LIKE": "debian", "VERSION_ID": "1.7_x86-64",
+                                     "VERSION_CODENAME": "1.7_x86-64"},
+                            raising=False)
+        assert collectors_linux.os_info() == "Astra Linux 1.7_x86-64"
+
+    def test_linux_os_info_version_id_appended_to_name_fallback(self, monkeypatch):
+        monkeypatch.setattr(platform, "freedesktop_os_release",
+                            lambda: {"NAME": "Some OS", "VERSION_ID": "42"}, raising=False)
+        assert collectors_linux.os_info() == "Some OS 42"
+
+    def test_linux_os_info_empty_version_id_is_ignored(self, monkeypatch):
+        monkeypatch.setattr(platform, "freedesktop_os_release",
+                            lambda: {"PRETTY_NAME": "Some OS", "VERSION_ID": "  "}, raising=False)
+        assert collectors_linux.os_info() == "Some OS"
+
+    def test_linux_os_info_empty_fields_fall_back_to_platform(self, monkeypatch):
+        monkeypatch.setattr(platform, "freedesktop_os_release", lambda: {"PRETTY_NAME": "", "ID": "x"}, raising=False)
         assert collectors_linux.os_info() == platform.platform()
+
+    @pytest.mark.parametrize("exc", [AttributeError("no freedesktop_os_release"), OSError("no /etc/os-release")])
+    def test_linux_os_info_falls_back_to_platform_on_error(self, monkeypatch, exc):
+        def boom():
+            raise exc
+        monkeypatch.setattr(platform, "freedesktop_os_release", boom, raising=False)
+        assert collectors_linux.os_info() == platform.platform()
+
+    def test_linux_os_info_without_function_at_all(self, monkeypatch):
+        """Python < 3.10 (например Astra 1.7 с 3.7): функции нет — platform.platform()."""
+        monkeypatch.delattr(platform, "freedesktop_os_release", raising=False)
+        assert collectors_linux.os_info() == platform.platform()
+
+    def test_linux_os_info_real_call_is_non_empty(self):
+        s = collectors_linux.os_info()
+        assert isinstance(s, str) and s and s != "unknown"
 
     def test_windows_os_info_format(self, monkeypatch):
         monkeypatch.setattr(platform, "release", lambda: "10")
