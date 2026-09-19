@@ -38,6 +38,7 @@ import pytest
 from release_stub import CLIENT_KEY, FakeReleaseServer
 
 STUB_HOST, STUB_PORT = "127.0.0.1", 8000      # встроенный адрес сервера в exe
+EXPECTED_PLATFORM = "windows" if os.name == "nt" else "linux"   # что exe шлёт в X-Client-Platform
 AGENT_TIMEOUT = 180                            # с: один запуск exe с --apply-update-now
 CHILD_TIMEOUT = 120                            # с: ожидание завершения перезапущенного exe
 
@@ -98,6 +99,7 @@ def stub():
 @pytest.fixture
 def srv(stub):
     stub.release, stub.data = None, b""
+    stub.releases.clear()
     stub.requests.clear()
     return stub
 
@@ -195,7 +197,9 @@ class OldFileWatcher:
 def test_update_replaces_running_exe_then_stays_up_to_date(builds, srv, workdir):
     exe, old_file, download_file = (workdir / "client_agent.exe", workdir / "client_agent.exe.old",
                                     workdir / "client_agent.exe.download")
-    srv.set_release(builds.new_version, builds.new_bytes)
+    # релиз опубликован только под ОС прогона: exe получит его, лишь прислав
+    # верный X-Client-Platform (на Linux без заголовка стаб отдал бы windows-релиз, т.е. 404)
+    srv.set_release(builds.new_version, builds.new_bytes, platform=EXPECTED_PLATFORM)
 
     # 1) старая версия находит релиз, скачивает, заменяет саму себя и
     #    перезапускает новую версию с теми же аргументами
@@ -210,10 +214,11 @@ def test_update_replaces_running_exe_then_stays_up_to_date(builds, srv, workdir)
     assert watcher.seen and watcher.sha == builds.old_sha, "старая exe должна была уехать в .old"
     assert not download_file.exists(), ".download после установки не должен оставаться"
     # перезапущенная новая версия дошла до сервера (третий запрос) и сочла себя актуальной
-    assert [p for p, _ in srv.requests] == [
+    assert [r.path for r in srv.requests] == [
         "/api/client-release", "/api/download/client-agent", "/api/client-release",
     ], srv.requests
-    assert all(key == CLIENT_KEY for _, key in srv.requests)
+    assert all(r.client_key == CLIENT_KEY for r in srv.requests)
+    assert all(r.platform == EXPECTED_PLATFORM for r in srv.requests), srv.requests
     assert child_pids, "перезапуск новой версии не состоялся (процесс в каталоге агента не замечен)"
 
     # 2) повторный запуск уже новой версии: up_to_date, без скачивания, exe не трогается
@@ -222,7 +227,7 @@ def test_update_replaces_running_exe_then_stays_up_to_date(builds, srv, workdir)
     assert r2.returncode == 0
     assert wait_agents_exit(workdir) == [], "up_to_date не должен ничего перезапускать"
     assert sha256_file(exe) == builds.new_sha
-    assert [p for p, _ in srv.requests] == ["/api/client-release"], srv.requests  # download не запрашивался
+    assert [r.path for r in srv.requests] == ["/api/client-release"], srv.requests  # download не запрашивался
     assert not download_file.exists()
     assert not old_file.exists(), ".old должен быть удалён при старте новой версии"
 
@@ -241,4 +246,4 @@ def test_release_with_wrong_sha256_is_rejected(builds, srv, workdir):
     assert sha256_file(exe) == builds.old_sha, "exe не должен был замениться"
     assert not old_file.exists(), ".old при отказе не создаётся"
     assert not download_file.exists(), "скачанный файл с неверным sha256 должен быть удалён"
-    assert [p for p, _ in srv.requests] == ["/api/client-release", "/api/download/client-agent"], srv.requests
+    assert [r.path for r in srv.requests] == ["/api/client-release", "/api/download/client-agent"], srv.requests

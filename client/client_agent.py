@@ -657,11 +657,21 @@ def cleanup_old_executable(exe_path: Optional[str]) -> None:
         _log_update(f"cannot remove {old}: {e}")
 
 
+def _client_platform() -> str:
+    """ОС этого агента для заголовка X-Client-Platform: релизы на сервере раздельные."""
+    return "windows" if os.name == "nt" else "linux"
+
+
+def _release_headers(client_key: str) -> Dict[str, str]:
+    """Заголовки запросов к серверу релизов: ключ агента и его платформа."""
+    return {"X-Client-Key": client_key, "X-Client-Platform": _client_platform()}
+
+
 def fetch_release_info(base_url: str, client_key: str, timeout: int = 30) -> Optional[Dict[str, Any]]:
-    """Метаданные последнего релиза или None (нет релизов / ошибка сети / не 200)."""
+    """Метаданные последнего релиза для своей ОС или None (нет релизов / ошибка сети / не 200)."""
     url = f"{base_url}/api/client-release"
     try:
-        resp = requests.get(url, headers={"X-Client-Key": client_key}, timeout=timeout)
+        resp = requests.get(url, headers=_release_headers(client_key), timeout=timeout)
     except Exception as e:
         _log_update(f"GET {url} failed: {e}")
         return None
@@ -679,11 +689,11 @@ def fetch_release_info(base_url: str, client_key: str, timeout: int = 30) -> Opt
 
 
 def download_release(base_url: str, client_key: str, dest_path: str, timeout: int = 300) -> Optional[str]:
-    """Скачивает бинарник во временный файл dest_path; возвращает sha256 байт или None."""
+    """Скачивает бинарник для своей ОС во временный файл dest_path; возвращает sha256 байт или None."""
     url = f"{base_url}/api/download/client-agent"
     h = hashlib.sha256()
     try:
-        with requests.get(url, headers={"X-Client-Key": client_key}, timeout=timeout, stream=True) as resp:
+        with requests.get(url, headers=_release_headers(client_key), timeout=timeout, stream=True) as resp:
             if resp.status_code != 200:
                 _log_update(f"GET {url} -> {resp.status_code}")
                 return None

@@ -153,13 +153,13 @@ class TestCheckAndApplyUpdate:
 
     def test_no_releases(self, srv, cfg, fake_exe):
         assert check_and_apply_update(cfg, "1.0", exe_path=fake_exe, do_relaunch=False) == "up_to_date"
-        assert srv.requests == [("/api/client-release", CLIENT_KEY)]  # download не запрашивался
+        assert [(r.path, r.client_key) for r in srv.requests] == [("/api/client-release", CLIENT_KEY)]  # download не запрашивался
 
     def test_same_or_older_version_no_download(self, srv, cfg, fake_exe):
         srv.set_release("1.2", b"NEW")
         assert check_and_apply_update(cfg, "1.2", exe_path=fake_exe, do_relaunch=False) == "up_to_date"
         assert check_and_apply_update(cfg, "1.3", exe_path=fake_exe, do_relaunch=False) == "up_to_date"
-        assert all(path == "/api/client-release" for path, _ in srv.requests)
+        assert all(r.path == "/api/client-release" for r in srv.requests)
         assert Path(fake_exe).read_bytes() == b"OLD-BINARY"
 
     def test_unparseable_server_version_is_skipped(self, srv, cfg, fake_exe):
@@ -177,7 +177,7 @@ class TestCheckAndApplyUpdate:
         monkeypatch.setattr(client_agent.sys, "frozen", False, raising=False)
         # exe_path не задан и процесс не упакован -> отказ без скачивания
         assert check_and_apply_update(cfg, "1.0", do_relaunch=False) == "error"
-        assert all(path == "/api/client-release" for path, _ in srv.requests)
+        assert all(r.path == "/api/client-release" for r in srv.requests)
 
     def test_sha_mismatch_rejects_and_cleans_temp(self, srv, cfg, fake_exe):
         srv.set_release("2.0", b"NEW-BINARY", sha256="00" * 32)
@@ -192,7 +192,7 @@ class TestCheckAndApplyUpdate:
         assert Path(fake_exe).read_bytes() == b"NEW-BINARY"
         assert Path(fake_exe + ".old").read_bytes() == b"OLD-BINARY"
         assert not os.path.exists(fake_exe + ".download")
-        assert [p for p, _ in srv.requests] == ["/api/client-release", "/api/download/client-agent"]
+        assert [r.path for r in srv.requests] == ["/api/client-release", "/api/download/client-agent"]
 
     def test_download_404_is_error_without_touching_exe(self, srv, cfg, fake_exe):
         # метаданные есть, но download отдаёт 404 (release=None только для download)
@@ -209,6 +209,34 @@ class TestCheckAndApplyUpdate:
         assert check_and_apply_update(cfg, "1.0", exe_path=fake_exe, do_relaunch=False) == "error"
         assert Path(fake_exe).read_bytes() == b"OLD-BINARY"
         assert not os.path.exists(fake_exe + ".download")
+
+    def test_agent_sends_its_platform_in_both_requests(self, srv, cfg, fake_exe):
+        srv.set_release("2.0", b"NEW-BINARY")
+        assert check_and_apply_update(cfg, "1.0", exe_path=fake_exe, do_relaunch=False) == "updated"
+        assert [r.path for r in srv.requests] == ["/api/client-release", "/api/download/client-agent"]
+        assert all(r.platform == client_agent._client_platform() for r in srv.requests), srv.requests
+
+    def test_release_of_other_platform_is_not_offered(self, srv, cfg, fake_exe):
+        other = "windows" if client_agent._client_platform() == "linux" else "linux"
+        srv.set_release("9.9", b"OTHER-BINARY", platform=other)
+        assert check_and_apply_update(cfg, "1.0", exe_path=fake_exe, do_relaunch=False) == "up_to_date"
+        assert Path(fake_exe).read_bytes() == b"OLD-BINARY"
+
+        srv.set_release("2.0", b"MY-BINARY", platform=client_agent._client_platform())
+        assert check_and_apply_update(cfg, "1.0", exe_path=fake_exe, do_relaunch=False) == "updated"
+        assert Path(fake_exe).read_bytes() == b"MY-BINARY"
+
+
+class TestClientPlatform:
+    def test_matches_os_name(self, monkeypatch):
+        monkeypatch.setattr(client_agent.os, "name", "nt")
+        assert client_agent._client_platform() == "windows"
+        monkeypatch.setattr(client_agent.os, "name", "posix")
+        assert client_agent._client_platform() == "linux"
+
+    def test_headers_carry_key_and_platform(self):
+        h = client_agent._release_headers("KEY")
+        assert h == {"X-Client-Key": "KEY", "X-Client-Platform": client_agent._client_platform()}
 
 
 # ------------------------------------------------------------- файловые операции
