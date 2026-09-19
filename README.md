@@ -78,18 +78,23 @@ pyinstaller client/client_agent.spec --distpath client/dist --workpath client/bu
 git checkout client/VERSION
 ```
 
-Релизы хранятся на сервере в Postgres (таблица `client_releases`), текущий —
-последний загруженный. Публикация (ключ `api_key`, не ключ агента):
+Релизы хранятся на сервере в Postgres (таблица `client_releases`) отдельно по
+ОС (колонка `platform`: `windows` или `linux`), текущий — последний
+загруженный для своей ОС. Публикация (ключ `api_key`, не ключ агента):
 
 ```bash
 curl -sS --fail -X POST -H "X-API-Key: $MONITORING_API_KEY" \
-  -F version=1.3 -F file=@client/dist/client_agent.exe \
+  -F version=1.3 -F platform=windows -F file=@client/dist/client_agent.exe \
   http://127.0.0.1:8000/api/client-release
 ```
 
+Поле `platform` необязательно, по умолчанию `windows`; другие значения, кроме
+`windows`/`linux`, дают 400.
+
 Агент читает метаданные `GET /api/client-release` и скачивает
 `GET /api/download/client-agent` с заголовком `X-Client-Key` (переменная
-`MONITORING_CLIENT_UPDATE_KEY`). Базовый адрес сервера выводится из адреса
+`MONITORING_CLIENT_UPDATE_KEY`) и заголовком `X-Client-Platform` со своей ОС.
+Без этого заголовка (старые задеплоенные агенты) сервер отдаёт windows-релиз. Базовый адрес сервера выводится из адреса
 приёма `MONITORING_SERVER_URL` (суффикс `/api/ingest` отбрасывается; без него
 обновления отключены).
 
@@ -114,15 +119,17 @@ curl -sS --fail -X POST -H "X-API-Key: $MONITORING_API_KEY" \
 агента нет: в упакованном onefile-exe `__file__` указывает во временный каталог
 PyInstaller, поэтому файл рядом с exe всё равно не читался бы.
 
-### Автотест самообновления в CI (windows-latest)
+### Автотест самообновления в CI (windows-latest и ubuntu-latest)
 
-Джоба `selfupdate-e2e-windows` в `.github/workflows/ci.yml` проверяет замену
-работающего exe на настоящей Windows, чтобы не делать это руками при каждом
-изменении `client_agent.py`. Она собирает две версии exe (текущую из
-`client/VERSION` и следующую, файл потом возвращается через `git checkout`),
-поднимает стаб сервера релизов на `127.0.0.1:8000` (адрес встроен в exe, см.
-выше) и запускает старую exe с `--apply-update-now`. Сценарии в
-`client/tests/test_selfupdate_e2e.py`:
+Джобы `selfupdate-e2e-windows` и `selfupdate-e2e-linux` в
+`.github/workflows/ci.yml` проверяют замену работающего бинарника на настоящей
+ОС, чтобы не делать это руками при каждом изменении `client_agent.py`. Каждая
+собирает две версии (текущую из `client/VERSION` и следующую, файл потом
+возвращается через `git checkout`), поднимает стаб сервера релизов на
+`127.0.0.1:8000` (адрес встроен в бинарник, см. выше) и запускает старую версию
+с `--apply-update-now`. Linux-версии собираются в контейнере
+`python:3.11-buster`, как и в `build-linux-agent` (glibc 2.28). Сценарии в
+`client/tests/test_selfupdate_e2e.py` (общие для обеих ОС):
 
 - обновление: код выхода 0, на месте старой exe лежит новая (sha256), старая
   ушла в `.old`, новая версия перезапущена и сама сходила на сервер; повторный
@@ -175,16 +182,19 @@ kernel threads (`pid`/`ppid == 2`), сервисные учётки (`uid < UID_
 ## CI/CD: автопубликация релиза агента
 
 В `.github/workflows/ci.yml` джоба `publish-client-release` берёт
-`client_agent.exe`, собранный джобой `build-windows-agent` в том же прогоне,
-читает версию из `client/VERSION` и публикует релиз на сервер запросом
-`POST /api/client-release`. Агенты подхватят его при следующей проверке.
+`client_agent.exe` от `build-windows-agent` и `client_agent` от
+`build-linux-agent` (оба из того же прогона), читает версию из `client/VERSION`
+и публикует два релиза на сервер запросами `POST /api/client-release` с
+`platform=windows` и `platform=linux`. Агент подхватит релиз своей ОС при
+следующей проверке (он шлёт заголовок `X-Client-Platform`).
 
 Условия запуска (заданы в файле, не в настройках GitHub):
 
 - только событие `push` в ветку `master` этого репозитория;
 - только если в этом push менялось что-то в `client/**` (джоба
   `detect-client-changes`);
-- после зелёных `test`, `build-windows-agent` и `selfupdate-e2e-windows`;
+- после зелёных `test`, `build-windows-agent`, `build-linux-agent`,
+  `selfupdate-e2e-windows` и `selfupdate-e2e-linux`;
 - никогда на `pull_request`; триггера `workflow_dispatch` у workflow нет.
 
 Джоба выполняется на self-hosted раннере с меткой `monitoring-publisher`,
