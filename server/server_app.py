@@ -716,6 +716,20 @@ def _group_stopped(rows: List[DbRow], limit_per_group: int = 80) -> List[Dict[st
     return list(groups.values())
 
 
+def _platform_from_os_info(os_info: Optional[str]) -> str:
+    """Платформа машины по её os_info (для выбора релиза, с которым сравнивать версию).
+
+    Windows-коллектор всегда отдаёт строку вида "Windows 10 ...", Linux-коллектор —
+    PRETTY_NAME дистрибутива ("ALT Workstation 11.1", "Astra Linux 1.7_x86-64").
+    Пустой os_info (машина ещё не присылала его) считаем windows — как и запрос
+    агента без заголовка X-Client-Platform.
+    """
+    v = str(os_info or "").strip().lower()
+    if not v:
+        return CLIENT_PLATFORM_DEFAULT
+    return "windows" if v.startswith("windows") else "linux"
+
+
 @app.get("/api/latest")
 def latest(x_api_key: Optional[str] = Header(default=None), limit_machines: int = 50):
     require_api_key(x_api_key)
@@ -727,9 +741,12 @@ def latest(x_api_key: Optional[str] = Header(default=None), limit_machines: int 
     conn = db_connect()
     cur = conn.cursor()
 
-    # TODO(фаза 1): сравнение версий на дашборде пока ведётся по windows-релизу
-    rel = _get_latest_client_release(cur, CLIENT_PLATFORM_DEFAULT) or {}
-    latest_client_version = str(rel.get("version") or "").strip()
+    # Версии релизов раздельные по ОС, поэтому каждую машину сравниваем
+    # с релизом её платформы (определяется по os_info).
+    latest_by_platform = {
+        p: str((_get_latest_client_release(cur, p) or {}).get("version") or "").strip()
+        for p in CLIENT_PLATFORMS
+    }
 
     cur.execute(
         """
@@ -830,6 +847,7 @@ def latest(x_api_key: Optional[str] = Header(default=None), limit_machines: int 
 
 
         client_version = mr["client_version"] or ""
+        latest_client_version = latest_by_platform.get(_platform_from_os_info(mr["os_info"]), "")
         client_outdated = bool(latest_client_version and client_version and (client_version != latest_client_version))
 
         result.append(

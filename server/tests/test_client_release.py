@@ -241,17 +241,23 @@ class TestDownloadClientAgent:
 # ------------------------------------------------ дашборд: latest_client_version
 
 class TestDashboardLatestClientVersion:
-    def _event(self, version):
-        return {
-            "machine_name": "PC1",
+    def _event(self, version, machine="PC1", os_info=None):
+        e = {
+            "machine_name": machine,
             "process_name": "app.exe",
             "pid": 1,
             "start_time": "2026-09-17T09:00:00",
             "sample_time": "2026-09-17T09:05:00",
             "duration_seconds": 300,
             "client_version": version,
-            "unique_key": f"PC1|1|{version}",
+            "unique_key": f"{machine}|1|{version}",
         }
+        if os_info is not None:
+            e["os_info"] = os_info
+        return e
+
+    def _by_machine(self, client):
+        return {m["machine_name"]: m for m in client.get("/api/latest", headers=PUBLISH_HEADERS).json()["latest"]}
 
     def test_no_release_means_not_outdated(self, client):
         insert_events([self._event("1.0")])
@@ -272,3 +278,38 @@ class TestDashboardLatestClientVersion:
         publish(client, "1.1", b"x")
         item = client.get("/api/latest", headers=PUBLISH_HEADERS).json()["latest"][0]
         assert item["client_outdated"] is False
+
+    def test_each_machine_compares_with_its_platform_release(self, client):
+        # версии по ОС разъезжаются: windows 1.1, linux 2.0
+        insert_events([
+            self._event("1.1", machine="PC1", os_info="Windows 10 Pro"),
+            self._event("2.0", machine="ALT1", os_info="ALT Workstation 11.1 (Prometheus)"),
+        ])
+        publish(client, "1.1", b"win-bin", platform="windows")
+        publish(client, "2.0", b"linux-bin", platform="linux")
+
+        items = self._by_machine(client)
+        assert items["PC1"]["latest_client_version"] == "1.1"
+        assert items["PC1"]["client_outdated"] is False
+        assert items["ALT1"]["latest_client_version"] == "2.0"
+        assert items["ALT1"]["client_outdated"] is False
+
+    def test_linux_machine_is_outdated_against_linux_release_only(self, client):
+        insert_events([self._event("1.0", machine="ALT1", os_info="Astra Linux 1.7_x86-64")])
+        publish(client, "9.9", b"win-bin", platform="windows")
+        item = self._by_machine(client)["ALT1"]
+        # под linux релизов нет — сравнивать не с чем, windows-версия не подставляется
+        assert item["latest_client_version"] == ""
+        assert item["client_outdated"] is False
+
+        publish(client, "2.0", b"linux-bin", platform="linux")
+        item = self._by_machine(client)["ALT1"]
+        assert item["latest_client_version"] == "2.0"
+        assert item["client_outdated"] is True
+
+    def test_machine_without_os_info_falls_back_to_windows(self, client):
+        insert_events([self._event("1.0", machine="OLD1")])
+        publish(client, "1.1", b"win-bin", platform="windows")
+        item = self._by_machine(client)["OLD1"]
+        assert item["latest_client_version"] == "1.1"
+        assert item["client_outdated"] is True
