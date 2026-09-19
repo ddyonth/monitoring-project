@@ -93,8 +93,8 @@ jobs:
   # Сборка агента под Linux (Astra/ALT): тот же client_agent.spec, что и для
   # Windows (имя без расширения, console/upx под Linux не мешают). Ставятся
   # только Linux-зависимости (client/requirements-linux.txt, без pywin32-ctypes
-  # и pefile). Артефакт публикуется в CI, в релизы сервера не попадает —
-  # publish-client-release по-прежнему только про Windows exe.
+  # и pefile). Артефакт забирает publish-client-release и публикует на сервер
+  # с platform=linux (Windows exe публикуется там же с platform=windows).
   #
   # Сборка идёт внутри Docker-контейнера python:3.11-buster (Debian 10,
   # glibc 2.28, Python 3.11, binutils/objdump для PyInstaller уже есть): бинарник,
@@ -214,6 +214,79 @@ jobs:
           MONITORING_SELFUPDATE_E2E_NEW_VERSION: ${{ steps.new_version.outputs.version }}
         run: python -m pytest client/tests/test_selfupdate_e2e.py -v -ra -s
 
+  # Сквозная проверка самообновления на Linux: то же, что selfupdate-e2e-windows,
+  # но обе версии собираются в контейнере python:3.11-buster (glibc 2.28) — тем же
+  # способом, что и в build-linux-agent, иначе бинарник не запустится на Astra 1.7.
+  # Один docker run строит обе версии подряд (между сборками меняется client/VERSION),
+  # чтобы не платить дважды за установку зависимостей в контейнер.
+  # Сам тест (pytest, стаб сервера релизов) идёт на хосте раннера: бинарнику,
+  # собранному под glibc 2.28, более новая glibc ubuntu-latest не мешает.
+  # Не зависит от build-linux-agent: собирает свои бинарники сама.
+  selfupdate-e2e-linux:
+    name: Self-update end-to-end (ubuntu-latest, real binary)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      # Зависимости нужны хосту только для pytest и самого теста (psutil,
+      # requests); сборка ставит свои внутри контейнера.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      # "Старая" версия — client/VERSION как в репозитории, "новая" — последний
+      # компонент + 1 (1.2 -> 1.3); файл возвращается на место шагом ниже.
+      - name: Build current (old) and next (new) versions in python:3.11-buster
+        id: new_version
+        run: |
+          old="$(tr -d '[:space:]' < client/VERSION)"
+          new="${old%.*}.$(( ${old##*.} + 1 ))"
+          echo "old=$old new=$new"
+          echo "version=$new" >> "$GITHUB_OUTPUT"
+          docker run --rm -v "$PWD:/src" -w /src -e NEW_VERSION="$new" python:3.11-buster bash -ec '
+            echo "build env: $(ldd --version | head -1) / $(python --version)"
+            python -m pip install --quiet --root-user-action=ignore --upgrade pip
+            pip install --quiet --root-user-action=ignore -r client/requirements-linux.txt
+            pyinstaller client/client_agent.spec --distpath client/dist/old --workpath client/build/old --noconfirm
+            echo "$NEW_VERSION" > client/VERSION
+            pyinstaller client/client_agent.spec --distpath client/dist/new --workpath client/build/new --noconfirm
+          '
+          sudo chown -R "$(id -u):$(id -g)" client/dist client/build client/_version.py client/VERSION
+
+      - name: Restore client/VERSION
+        if: always()
+        run: |
+          git checkout -- client/VERSION
+          if [ -n "$(git status --porcelain -- client/VERSION)" ]; then
+            echo "client/VERSION is still modified after restore"; exit 1
+          fi
+          echo "client/VERSION restored: $(cat client/VERSION)"
+
+      - name: Check build outputs
+        run: |
+          for p in client/dist/old/client_agent client/dist/new/client_agent; do
+            test -x "$p" || { echo "$p not found or not executable"; exit 1; }
+          done
+          sha256sum client/dist/old/client_agent client/dist/new/client_agent
+
+      # Тест сам поднимает стаб на 127.0.0.1:8000 и запускает бинарник; -s — чтобы
+      # вывод агента ([update] ...) попадал в лог джобы.
+      - name: Run self-update end-to-end test
+        env:
+          MONITORING_SELFUPDATE_E2E_OLD_EXE: ${{ github.workspace }}/client/dist/old/client_agent
+          MONITORING_SELFUPDATE_E2E_NEW_EXE: ${{ github.workspace }}/client/dist/new/client_agent
+          MONITORING_SELFUPDATE_E2E_NEW_VERSION: ${{ steps.new_version.outputs.version }}
+        run: python -m pytest client/tests/test_selfupdate_e2e.py -v -ra -s
+
   # Определяет, менялось ли что-то в client/** в этом push (только push в master).
   # Выполняется на GitHub-раннере, чтобы self-hosted раннер не занимался пустыми прогонами.
   detect-client-changes:
@@ -254,7 +327,8 @@ jobs:
   # Settings -> Actions -> "Require approval for all external contributors".
   publish-client-release:
     name: Publish client release (self-hosted)
-    needs: [test, build-windows-agent, selfupdate-e2e-windows, detect-client-changes]
+    needs: [test, build-windows-agent, build-linux-agent,
+            selfupdate-e2e-windows, selfupdate-e2e-linux, detect-client-changes]
     if: >-
       github.event_name == 'push' &&
       github.ref == 'refs/heads/master' &&
@@ -264,13 +338,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Тот же артефакт, что собрала джоба build-windows-agent в этом прогоне
+      # Те же артефакты, что собрали build-windows-agent и build-linux-agent
+      # в этом прогоне; на сервере релизы хранятся раздельно по platform.
       - uses: actions/download-artifact@v4
         with:
           name: client_agent-windows
           path: release
 
-      # Версия — из client/VERSION того же коммита, из которого собран exe
+      - uses: actions/download-artifact@v4
+        with:
+          name: client_agent-linux
+          path: release-linux
+
+      # Версия — из client/VERSION того же коммита, из которого собраны бинарники
       - name: Read client version
         id: version
         shell: bash
@@ -279,9 +359,10 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "client version: $version"
           test -s release/client_agent.exe
-          sha256sum release/client_agent.exe
+          test -s release-linux/client_agent
+          sha256sum release/client_agent.exe release-linux/client_agent
 
-      - name: Publish to monitoring server
+      - name: Publish Windows release to monitoring server
         shell: bash
         env:
           MONITORING_SERVER_URL: ${{ secrets.MONITORING_SERVER_URL }}
@@ -293,7 +374,24 @@ jobs:
             -X POST \
             -H "X-API-Key: $MONITORING_API_KEY" \
             -F "version=${{ steps.version.outputs.version }}" \
+            -F "platform=windows" \
             -F "file=@release/client_agent.exe" \
+            "${MONITORING_SERVER_URL%/}/api/client-release"
+
+      - name: Publish Linux release to monitoring server
+        shell: bash
+        env:
+          MONITORING_SERVER_URL: ${{ secrets.MONITORING_SERVER_URL }}
+          MONITORING_API_KEY: ${{ secrets.MONITORING_API_KEY }}
+        run: |
+          test -n "$MONITORING_SERVER_URL" || { echo "secret MONITORING_SERVER_URL is not set"; exit 1; }
+          test -n "$MONITORING_API_KEY" || { echo "secret MONITORING_API_KEY is not set"; exit 1; }
+          curl -sS --fail-with-body --max-time 300 \
+            -X POST \
+            -H "X-API-Key: $MONITORING_API_KEY" \
+            -F "version=${{ steps.version.outputs.version }}" \
+            -F "platform=linux" \
+            -F "file=@release-linux/client_agent" \
             "${MONITORING_SERVER_URL%/}/api/client-release"
 
   # Автодеплой сервера: тот же ansible-playbook, что запускается руками
