@@ -78,18 +78,23 @@ pyinstaller client/client_agent.spec --distpath client/dist --workpath client/bu
 git checkout client/VERSION
 ```
 
-Релизы хранятся на сервере в Postgres (таблица `client_releases`), текущий —
-последний загруженный. Публикация (ключ `api_key`, не ключ агента):
+Релизы хранятся на сервере в Postgres (таблица `client_releases`) отдельно по
+ОС (колонка `platform`: `windows` или `linux`), текущий — последний
+загруженный для своей ОС. Публикация (ключ `api_key`, не ключ агента):
 
 ```bash
 curl -sS --fail -X POST -H "X-API-Key: $MONITORING_API_KEY" \
-  -F version=1.3 -F file=@client/dist/client_agent.exe \
+  -F version=1.3 -F platform=windows -F file=@client/dist/client_agent.exe \
   http://127.0.0.1:8000/api/client-release
 ```
 
+Поле `platform` необязательно, по умолчанию `windows`; другие значения, кроме
+`windows`/`linux`, дают 400.
+
 Агент читает метаданные `GET /api/client-release` и скачивает
 `GET /api/download/client-agent` с заголовком `X-Client-Key` (переменная
-`MONITORING_CLIENT_UPDATE_KEY`). Базовый адрес сервера выводится из адреса
+`MONITORING_CLIENT_UPDATE_KEY`) и заголовком `X-Client-Platform` со своей ОС.
+Без этого заголовка (старые задеплоенные агенты) сервер отдаёт windows-релиз. Базовый адрес сервера выводится из адреса
 приёма `MONITORING_SERVER_URL` (суффикс `/api/ingest` отбрасывается; без него
 обновления отключены).
 

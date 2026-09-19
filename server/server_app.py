@@ -334,6 +334,8 @@ def ensure_schema() -> None:
         );
         """
     )
+    # ОС релиза: в старых установках строки были только для Windows
+    cur.execute("ALTER TABLE client_releases ADD COLUMN IF NOT EXISTS platform TEXT NOT NULL DEFAULT 'windows';")
 
     # Alerts (MVP): server-side detections stored in DB
     cur.execute(
@@ -725,7 +727,8 @@ def latest(x_api_key: Optional[str] = Header(default=None), limit_machines: int 
     conn = db_connect()
     cur = conn.cursor()
 
-    rel = _get_latest_client_release(cur) or {}
+    # TODO(фаза 1): сравнение версий на дашборде пока ведётся по windows-релизу
+    rel = _get_latest_client_release(cur, CLIENT_PLATFORM_DEFAULT) or {}
     latest_client_version = str(rel.get("version") or "").strip()
 
     cur.execute(
@@ -3775,16 +3778,40 @@ def set_alert_status(
 # "1.4", "1.4.2": числа через точку, минимум два компонента
 _CLIENT_VERSION_RE = re.compile(r"^\d+(\.\d+)+$")
 
+# ОС, под которые публикуются релизы агента
+CLIENT_PLATFORMS = ("windows", "linux")
+CLIENT_PLATFORM_DEFAULT = "windows"
 
-def _get_latest_client_release(cur: DbCursor) -> Optional[Dict[str, Any]]:
-    """Метаданные последнего релиза без самого бинарника; None, если релизов нет."""
+
+def _client_platform_from_header(value: Optional[str]) -> str:
+    """Платформа агента из заголовка X-Client-Platform.
+
+    Заголовка нет или значение незнакомое -> "windows": так ведут себя уже
+    задеплоенные старые агенты, которые заголовок не шлют.
+    """
+    p = str(value or "").strip().lower()
+    return p if p in CLIENT_PLATFORMS else CLIENT_PLATFORM_DEFAULT
+
+
+def _get_latest_client_release(
+    cur: DbCursor, platform: str, with_data: bool = False
+) -> Optional[Dict[str, Any]]:
+    """Последний релиз для платформы; None, если релизов под неё нет.
+
+    with_data=False — только метаданные (без бинарника), with_data=True — ещё и data.
+    """
+    columns = "id, version, sha256, filename, size_bytes, uploaded_at"
+    if with_data:
+        columns += ", data"
     cur.execute(
-        """
-        SELECT id, version, sha256, filename, size_bytes, uploaded_at
+        f"""
+        SELECT {columns}
         FROM client_releases
+        WHERE platform = %s
         ORDER BY uploaded_at DESC, id DESC
         LIMIT 1
-        """
+        """,
+        (platform,),
     )
     row = cur.fetchone()
     return dict(row) if row else None
@@ -3793,6 +3820,7 @@ def _get_latest_client_release(cur: DbCursor) -> Optional[Dict[str, Any]]:
 @app.post("/api/client-release")
 def publish_client_release(
     version: str = Form(default=""),
+    platform: str = Form(default=CLIENT_PLATFORM_DEFAULT),
     file: UploadFile = File(...),
     x_api_key: Optional[str] = Header(default=None),
 ):
@@ -3801,6 +3829,10 @@ def publish_client_release(
     v = str(version or "").strip()
     if not _CLIENT_VERSION_RE.match(v):
         raise HTTPException(status_code=400, detail="version must be numbers separated by dots, e.g. 1.4 or 1.4.2")
+
+    plat = str(platform or "").strip().lower()
+    if plat not in CLIENT_PLATFORMS:
+        raise HTTPException(status_code=400, detail=f"platform must be one of {', '.join(CLIENT_PLATFORMS)}")
 
     data = file.file.read()
     if not data:
@@ -3816,22 +3848,25 @@ def publish_client_release(
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO client_releases(version, sha256, filename, size_bytes, data, uploaded_at)
-        VALUES(%s, %s, %s, %s, %s, %s)
+        INSERT INTO client_releases(version, sha256, filename, size_bytes, data, uploaded_at, platform)
+        VALUES(%s, %s, %s, %s, %s, %s, %s)
         """,
-        (v, sha, filename, len(data), data, now),
+        (v, sha, filename, len(data), data, now, plat),
     )
     conn.commit()
     conn.close()
-    return {"ok": True, "version": v, "sha256": sha, "size_bytes": len(data)}
+    return {"ok": True, "version": v, "platform": plat, "sha256": sha, "size_bytes": len(data)}
 
 
 @app.get("/api/client-release")
-def get_client_release(x_client_key: Optional[str] = Header(default=None)):
+def get_client_release(
+    x_client_key: Optional[str] = Header(default=None),
+    x_client_platform: Optional[str] = Header(default=None),
+):
     require_client_key(x_client_key)
     conn = db_connect()
     cur = conn.cursor()
-    rel = _get_latest_client_release(cur)
+    rel = _get_latest_client_release(cur, _client_platform_from_header(x_client_platform))
     conn.close()
     if not rel:
         return {"client_release": None}
@@ -3845,19 +3880,14 @@ def get_client_release(x_client_key: Optional[str] = Header(default=None)):
 
 
 @app.get("/api/download/client-agent")
-def download_client_agent(x_client_key: Optional[str] = Header(default=None)):
+def download_client_agent(
+    x_client_key: Optional[str] = Header(default=None),
+    x_client_platform: Optional[str] = Header(default=None),
+):
     require_client_key(x_client_key)
     conn = db_connect()
     cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT filename, data
-        FROM client_releases
-        ORDER BY uploaded_at DESC, id DESC
-        LIMIT 1
-        """
-    )
-    row = cur.fetchone()
+    row = _get_latest_client_release(cur, _client_platform_from_header(x_client_platform), with_data=True)
     conn.close()
     if not row:
         raise HTTPException(status_code=404, detail="Client release not found")

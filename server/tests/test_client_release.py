@@ -26,13 +26,23 @@ def client(db, monkeypatch):
     return TestClient(server_app.app)
 
 
-def publish(client, version, data: bytes, filename="client_agent.exe", headers=PUBLISH_HEADERS):
+def publish(client, version, data: bytes, filename="client_agent.exe", headers=PUBLISH_HEADERS, platform=None):
+    form = {"version": version}
+    if platform is not None:
+        form["platform"] = platform
     return client.post(
         "/api/client-release",
-        data={"version": version},
+        data=form,
         files={"file": (filename, data, "application/octet-stream")},
         headers=headers,
     )
+
+
+def agent_headers(platform=None):
+    h = dict(AGENT_HEADERS)
+    if platform is not None:
+        h["X-Client-Platform"] = platform
+    return h
 
 
 # ------------------------------------------------------------ POST (publish)
@@ -88,6 +98,34 @@ class TestPublishClientRelease:
         row = db.execute("SELECT filename FROM client_releases").fetchone()
         assert "\\" not in row["filename"] and "/" not in row["filename"]
 
+    def test_platform_defaults_to_windows(self, client, db):
+        # старые публикаторы (CI до этой задачи) поле platform не шлют
+        assert publish(client, "1.0", b"x").status_code == 200
+        assert db.execute("SELECT platform FROM client_releases").fetchone()["platform"] == "windows"
+
+    @pytest.mark.parametrize("plat", ["windows", "linux"])
+    def test_platform_is_stored(self, client, db, plat):
+        r = publish(client, "1.0", b"x", platform=plat)
+        assert r.status_code == 200, r.text
+        assert r.json()["platform"] == plat
+        assert db.execute("SELECT platform FROM client_releases").fetchone()["platform"] == plat
+
+    def test_platform_is_stripped_and_lowercased(self, client, db):
+        assert publish(client, "1.0", b"x", platform=" Linux ").status_code == 200
+        assert db.execute("SELECT platform FROM client_releases").fetchone()["platform"] == "linux"
+
+    def test_empty_platform_means_default(self, client, db):
+        # FastAPI подставляет default вместо пустого значения Form-поля,
+        # поэтому platform="" неотличим от отсутствующего поля
+        assert publish(client, "1.0", b"x", platform="").status_code == 200
+        assert db.execute("SELECT platform FROM client_releases").fetchone()["platform"] == "windows"
+
+    @pytest.mark.parametrize("bad", ["macos", "win", "linux2", "windows linux"])
+    def test_invalid_platform_gives_400(self, client, db, bad):
+        r = publish(client, "1.0", b"x", platform=bad)
+        assert r.status_code == 400, r.text
+        assert db.execute("SELECT COUNT(*) FROM client_releases").fetchone()["count"] == 0
+
 
 # ------------------------------------------------------- GET /api/client-release
 
@@ -118,6 +156,38 @@ class TestGetClientRelease:
         # api_key не является ключом агента
         assert client.get("/api/client-release", headers=PUBLISH_HEADERS).status_code == 401
 
+    def test_platforms_do_not_mix(self, client):
+        publish(client, "1.0", b"win-bin", platform="windows")
+        publish(client, "2.0", b"linux-bin", platform="linux")
+        win = client.get("/api/client-release", headers=agent_headers("windows")).json()["client_release"]
+        lin = client.get("/api/client-release", headers=agent_headers("linux")).json()["client_release"]
+        assert win["version"] == "1.0" and win["sha256"] == hashlib.sha256(b"win-bin").hexdigest()
+        assert lin["version"] == "2.0" and lin["sha256"] == hashlib.sha256(b"linux-bin").hexdigest()
+
+    def test_agent_without_header_gets_windows(self, client):
+        publish(client, "1.0", b"win-bin", platform="windows")
+        publish(client, "2.0", b"linux-bin", platform="linux")
+        rel = client.get("/api/client-release", headers=AGENT_HEADERS).json()["client_release"]
+        assert rel["version"] == "1.0"
+
+    @pytest.mark.parametrize("bad", ["", "macos", "LiNuX2"])
+    def test_unknown_platform_header_falls_back_to_windows(self, client, bad):
+        publish(client, "1.0", b"win-bin", platform="windows")
+        publish(client, "2.0", b"linux-bin", platform="linux")
+        rel = client.get("/api/client-release", headers=agent_headers(bad)).json()["client_release"]
+        assert rel["version"] == "1.0"
+
+    def test_platform_header_is_case_insensitive(self, client):
+        publish(client, "2.0", b"linux-bin", platform="linux")
+        rel = client.get("/api/client-release", headers=agent_headers("Linux")).json()["client_release"]
+        assert rel["version"] == "2.0"
+
+    def test_no_release_for_platform_gives_null(self, client):
+        publish(client, "1.0", b"win-bin", platform="windows")
+        r = client.get("/api/client-release", headers=agent_headers("linux"))
+        assert r.status_code == 200
+        assert r.json() == {"client_release": None}
+
 
 # ------------------------------------------------- GET /api/download/client-agent
 
@@ -144,6 +214,28 @@ class TestDownloadClientAgent:
     def test_requires_client_key(self, client):
         publish(client, "1.0", b"x")
         assert client.get("/api/download/client-agent").status_code == 401
+
+    def test_platforms_do_not_mix(self, client):
+        publish(client, "1.0", b"win-bin", filename="client_agent.exe", platform="windows")
+        publish(client, "2.0", b"linux-bin", filename="client_agent", platform="linux")
+
+        win = client.get("/api/download/client-agent", headers=agent_headers("windows"))
+        assert win.content == b"win-bin"
+        assert 'filename="client_agent.exe"' in win.headers["content-disposition"]
+
+        lin = client.get("/api/download/client-agent", headers=agent_headers("linux"))
+        assert lin.content == b"linux-bin"
+        assert 'filename="client_agent"' in lin.headers["content-disposition"]
+
+    def test_agent_without_header_gets_windows(self, client):
+        publish(client, "1.0", b"win-bin", platform="windows")
+        publish(client, "2.0", b"linux-bin", platform="linux")
+        assert client.get("/api/download/client-agent", headers=AGENT_HEADERS).content == b"win-bin"
+
+    def test_404_when_platform_has_no_release(self, client):
+        publish(client, "1.0", b"win-bin", platform="windows")
+        r = client.get("/api/download/client-agent", headers=agent_headers("linux"))
+        assert r.status_code == 404
 
 
 # ------------------------------------------------ дашборд: latest_client_version
